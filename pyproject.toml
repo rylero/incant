@@ -1,0 +1,21 @@
+[project]
+name = "speechtotext"
+version = "0.1.0"
+description = "Push-a-key, speak, get text typed at your cursor. Local faster-whisper (large-v3) on GPU."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "faster-whisper>=1.1.0",
+    "sounddevice>=0.4.7",
+    "numpy>=1.26",
+    "keyboard>=0.13.5",
+    # CUDA 12 + cuDNN 9 runtime for CTranslate2 GPU (works on RTX 5070 Ti / Blackwell)
+    "nvidia-cublas-cu12>=12.4",
+    "nvidia-cudnn-cu12>=9.0",
+]
+
+[project.scripts]
+stt = "stt:main"
+ui = "ui:main"
+
+[tool.uv]
+# keep CUDA wheels; they are large but needed for GPU
