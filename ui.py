@@ -65,12 +65,13 @@ class App:
         self.settings = load_settings()
         self.model = None
         self.model_lock = threading.Lock()
-        self.rec = stt.Recorder()
+        self.engine = stt.AudioEngine()  # always-on mic + pre-roll
         self.busy = threading.Event()
         self.hotkey_handle = None
         self.ui_queue: queue.Queue = queue.Queue()
         # continuous-mode state
-        self.stream_rec: stt.StreamingRecorder | None = None
+        self.continuous_on = False
+        self.segmenter: stt.PhraseSegmenter | None = None
         self.phrase_queue: queue.Queue = queue.Queue()
         self.phrase_worker: threading.Thread | None = None
 
@@ -145,6 +146,10 @@ class App:
         frm.rowconfigure(5, weight=1)
 
         self.bind_hotkey(self.settings["hotkey"])
+        try:
+            self.engine.start_stream()  # start mic now so pre-roll is always filling
+        except Exception as e:  # noqa: BLE001
+            self.log_line(f"[audio] could not open mic: {e}")
         self.reload_model()  # initial load
         self.root.after(100, self._drain_queue)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -243,31 +248,36 @@ class App:
         if self.busy.is_set():
             self.log_line("[stt] still transcribing…")
             return
-        if not self.rec.active:
-            self.rec.start()
+        if not self.engine.capturing:
+            self.engine.begin_capture()  # seeded with pre-roll -> no clipped first word
             self.set_status("● recording… (hotkey again to stop)")
         else:
-            audio = self.rec.stop()
+            audio = self.engine.end_capture()
             self.busy.set()
             self.set_status("transcribing…")
             threading.Thread(target=self._do_transcribe, args=(audio,), daemon=True).start()
 
     # --- continuous mode (type phrase-by-phrase on pauses) -----------------
     def _toggle_continuous(self) -> None:
-        if self.stream_rec is None:
-            seg = stt.PhraseSegmenter(on_phrase=self.phrase_queue.put)
-            self.stream_rec = stt.StreamingRecorder(seg)
-            self.phrase_worker = threading.Thread(
-                target=self._phrase_loop, daemon=True
-            )
+        if not self.continuous_on:
+            self.segmenter = stt.PhraseSegmenter(on_phrase=self.phrase_queue.put)
+            # prime with pre-roll so the very first phrase keeps its onset
+            for f in (self.engine.preroll_audio(),):
+                if f.size:
+                    self.segmenter.feed(f)
+            self.phrase_worker = threading.Thread(target=self._phrase_loop, daemon=True)
             self.phrase_worker.start()
-            self.stream_rec.start()
+            self.engine.set_frame_listener(self.segmenter.feed)
+            self.continuous_on = True
             self.set_status("● listening… (types as you pause; hotkey to stop)")
             self.log_line("[stt] continuous mode on")
         else:
-            self.stream_rec.stop()  # flushes any in-progress phrase
-            self.stream_rec = None
-            self.phrase_queue.put(None)  # tell worker to exit after draining
+            self.engine.set_frame_listener(None)
+            if self.segmenter is not None:
+                self.segmenter.finish()  # flush any in-progress phrase
+            self.segmenter = None
+            self.phrase_queue.put(None)  # worker exits after draining
+            self.continuous_on = False
             self.set_status("ready — press your hotkey to talk")
             self.log_line("[stt] continuous mode off")
 
@@ -304,11 +314,10 @@ class App:
     # -- lifecycle ----------------------------------------------------------
     def on_close(self) -> None:
         try:
-            if self.rec.active:
-                self.rec.stop()
-            if self.stream_rec is not None:
-                self.stream_rec.stop()
+            if self.continuous_on:
+                self.engine.set_frame_listener(None)
                 self.phrase_queue.put(None)
+            self.engine.stop_stream()
             keyboard.unhook_all_hotkeys()
         except Exception:  # noqa: BLE001
             pass

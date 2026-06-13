@@ -15,6 +15,7 @@ import sys
 import glob
 import time
 import threading
+from collections import deque
 
 # ---------------------------------------------------------------------------
 # Config (override via env vars)
@@ -83,51 +84,115 @@ def load_model(model_size: str | None = None) -> WhisperModel:
 
 
 # ---------------------------------------------------------------------------
-# Recorder: toggle on/off, capture mono 16 kHz float32
+# AudioEngine: ONE always-on mic stream + a rolling pre-roll buffer.
+#
+# Why always-on: opening an InputStream on demand drops the first ~100-300ms
+# while the device ramps, which clips the first word. Keeping the stream open
+# and prepending a short pre-roll of audio captured *before* the keypress means
+# the onset of the first word is always present, and VAD has real leading
+# context so it trims silence instead of your speech.
+#
+# Audio ingestion is split into _ingest(frame) (pure, unit-testable) and the
+# sounddevice _callback that calls it.
 # ---------------------------------------------------------------------------
-class Recorder:
-    def __init__(self) -> None:
-        self._frames: list[np.ndarray] = []
+class AudioEngine:
+    def __init__(
+        self,
+        sample_rate: int = SAMPLE_RATE,
+        blocksize: int = 1600,      # 100 ms frames at 16 kHz
+        preroll_s: float = 0.5,
+    ) -> None:
+        self.sr = sample_rate
+        self.blocksize = blocksize
+        ring_len = max(1, round(preroll_s * sample_rate / blocksize))
+        self._ring: deque[np.ndarray] = deque(maxlen=ring_len)
+        self._cap: list[np.ndarray] = []
+        self._capturing = False
+        self._on_frame = None  # optional live consumer (continuous mode)
+        self._lock = threading.Lock()
         self._stream: sd.InputStream | None = None
-        self.active = False
 
+    # --- core (testable) ---------------------------------------------------
+    def _ingest(self, frame: np.ndarray) -> None:
+        frame = np.asarray(frame, dtype=np.float32).flatten()
+        with self._lock:
+            self._ring.append(frame)
+            if self._capturing:
+                self._cap.append(frame)
+            listener = self._on_frame
+        if listener is not None:
+            listener(frame)
+
+    def begin_capture(self) -> None:
+        """Start collecting; seed with the pre-roll ring so the onset is kept."""
+        with self._lock:
+            self._cap = list(self._ring)
+            self._capturing = True
+
+    def end_capture(self) -> np.ndarray:
+        with self._lock:
+            self._capturing = False
+            frames, self._cap = self._cap, []
+        if not frames:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(frames).flatten()
+
+    def preroll_audio(self) -> np.ndarray:
+        """Snapshot of the pre-roll ring (used to prime continuous mode)."""
+        with self._lock:
+            frames = list(self._ring)
+        if not frames:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(frames).flatten()
+
+    def set_frame_listener(self, fn) -> None:
+        with self._lock:
+            self._on_frame = fn
+
+    @property
+    def capturing(self) -> bool:
+        return self._capturing
+
+    # --- device ------------------------------------------------------------
     def _callback(self, indata, frames, time_info, status):  # noqa: ANN001
         if status:
             print(f"[audio] {status}", flush=True)
-        self._frames.append(indata.copy())
+        self._ingest(indata[:, 0].copy())
 
-    def start(self) -> None:
-        self._frames = []
+    def start_stream(self) -> None:
+        if self._stream is not None:
+            return
         self._stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
+            samplerate=self.sr,
             channels=1,
             dtype="float32",
+            blocksize=self.blocksize,
             callback=self._callback,
         )
         self._stream.start()
-        self.active = True
 
-    def stop(self) -> np.ndarray:
-        self.active = False
+    def stop_stream(self) -> None:
         if self._stream is not None:
             self._stream.stop()
             self._stream.close()
             self._stream = None
-        if not self._frames:
-            return np.zeros(0, dtype=np.float32)
-        return np.concatenate(self._frames, axis=0).flatten()
 
 
 def transcribe_audio(model: WhisperModel, audio: np.ndarray, language: str | None):
     """Run Whisper on a mono 16k float32 array. Returns (text, language)."""
     if audio.size < SAMPLE_RATE * 0.3:  # <0.3s -> nothing useful
         return "", None
+    # Pad ~0.2s of silence at the front: Whisper occasionally drops the first
+    # token when speech starts at sample 0, and silero VAD keeps the onset when
+    # it has a little lead-in. speech_pad_ms widens kept speech regions so a
+    # soft first word is not trimmed.
+    audio = np.concatenate([np.zeros(int(SAMPLE_RATE * 0.2), np.float32), audio])
     segments, info = model.transcribe(
         audio,
         language=language,
         beam_size=5,
         vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=300),
+        vad_parameters=dict(min_silence_duration_ms=300, speech_pad_ms=600),
     )
     text = "".join(seg.text for seg in segments).strip()
     return text, info.language
@@ -198,38 +263,6 @@ class PhraseSegmenter:
         self._flush()
 
 
-class StreamingRecorder:
-    """Captures the mic and feeds frames to a PhraseSegmenter in real time."""
-
-    def __init__(self, segmenter: PhraseSegmenter) -> None:
-        self.segmenter = segmenter
-        self._stream: sd.InputStream | None = None
-        self.active = False
-
-    def _callback(self, indata, frames, time_info, status):  # noqa: ANN001
-        if status:
-            print(f"[audio] {status}", flush=True)
-        self.segmenter.feed(indata[:, 0].copy())
-
-    def start(self) -> None:
-        self._stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            callback=self._callback,
-        )
-        self._stream.start()
-        self.active = True
-
-    def stop(self) -> None:
-        self.active = False
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
-        self.segmenter.finish()
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -239,30 +272,19 @@ def main() -> None:
     print("[load] warming up...", flush=True)
     list(model.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32))[0])
     print("[load] warm.", flush=True)
-    rec = Recorder()
+
+    engine = AudioEngine()
+    engine.start_stream()  # always-on mic + pre-roll
     lock = threading.Lock()
     busy = threading.Event()
 
     def transcribe_and_type(audio: np.ndarray) -> None:
         try:
-            if audio.size < SAMPLE_RATE * 0.3:  # <0.3s -> nothing useful
-                print("[stt] too short, skipped", flush=True)
-                return
             t0 = time.time()
-            segments, info = model.transcribe(
-                audio,
-                language=LANGUAGE,
-                beam_size=5,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=300),
-            )
-            text = "".join(seg.text for seg in segments).strip()
+            text, lang = transcribe_audio(model, audio, LANGUAGE)
             dur = audio.size / SAMPLE_RATE
-            print(
-                f"[stt] {dur:.1f}s audio -> {time.time() - t0:.1f}s "
-                f"[{info.language} {info.language_probability:.2f}]: {text!r}",
-                flush=True,
-            )
+            print(f"[stt] {dur:.1f}s -> {time.time() - t0:.1f}s [{lang}]: {text!r}",
+                  flush=True)
             if text:
                 if TRAILING_SPACE:
                     text += " "
@@ -275,11 +297,11 @@ def main() -> None:
             if busy.is_set():
                 print("[stt] still transcribing, ignoring toggle", flush=True)
                 return
-            if not rec.active:
-                rec.start()
+            if not engine.capturing:
+                engine.begin_capture()
                 print("[rec] ● recording... (press hotkey again to stop)", flush=True)
             else:
-                audio = rec.stop()
+                audio = engine.end_capture()
                 busy.set()
                 print("[rec] ■ stopped, transcribing...", flush=True)
                 threading.Thread(
