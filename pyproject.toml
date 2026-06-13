@@ -1,7 +1,7 @@
 [project]
-name = "speechtotext"
+name = "incant"
 version = "0.1.0"
-description = "Push-a-key, speak, get text typed at your cursor. Local faster-whisper (large-v3) on GPU."
+description = "Local-first voice transcription with automation. Speak -> text at your cursor, or spoken commands that trigger actions."
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "faster-whisper>=1.1.0",
