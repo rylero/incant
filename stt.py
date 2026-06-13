@@ -150,6 +150,12 @@ class AudioEngine:
         with self._lock:
             self._on_frame = fn
 
+    def set_preroll(self, seconds: float) -> None:
+        """Resize the pre-roll ring (kept audio before a keypress)."""
+        with self._lock:
+            new_len = max(1, round(seconds * self.sr / self.blocksize))
+            self._ring = deque(list(self._ring)[-new_len:], maxlen=new_len)
+
     @property
     def capturing(self) -> bool:
         return self._capturing
@@ -197,6 +203,7 @@ def transcribe_audio(
     audio: np.ndarray,
     language: str | None,
     initial_prompt: str | None = None,
+    beam_size: int = 5,
 ):
     """Run Whisper on a mono 16k float32 array. Returns (clean_text, language)."""
     if audio.size < SAMPLE_RATE * 0.3:  # <0.3s -> nothing useful
@@ -209,13 +216,39 @@ def transcribe_audio(
     segments, info = model.transcribe(
         audio,
         language=language,
-        beam_size=5,
+        beam_size=beam_size,
         initial_prompt=initial_prompt,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=300, speech_pad_ms=600),
     )
     text = "".join(seg.text for seg in segments).strip()
     return clean_text(text), info.language
+
+
+def transcribe_words(
+    model: WhisperModel,
+    audio: np.ndarray,
+    language: str | None,
+    initial_prompt: str | None = None,
+    beam_size: int = 5,
+) -> list[dict]:
+    """Transcribe with word timestamps. Returns [{word, start, end}, ...]."""
+    if audio.size < SAMPLE_RATE * 0.3:
+        return []
+    segments, _ = model.transcribe(
+        audio,
+        language=language,
+        beam_size=beam_size,
+        initial_prompt=initial_prompt,
+        word_timestamps=True,
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=300, speech_pad_ms=600),
+    )
+    words: list[dict] = []
+    for seg in segments:
+        for w in (seg.words or []):
+            words.append({"word": w.word, "start": w.start, "end": w.end})
+    return words
 
 
 class TextStitcher:
@@ -246,6 +279,116 @@ class TextStitcher:
         prefix = " " if self._emitted else ""
         self._emitted += prefix + phrase
         return prefix + phrase
+
+
+# ---------------------------------------------------------------------------
+# Word-by-word mode: re-transcribe the growing utterance on a cadence and emit
+# only words that have become stable (commit-only, never rewrite -> no
+# backspacing). The last word(s) are held back until enough trailing audio
+# confirms them.
+# ---------------------------------------------------------------------------
+def stable_word_count(words: list[dict], audio_duration: float, hold_s: float) -> int:
+    """How many leading words end before the trailing 'hold' zone (are stable)."""
+    cutoff = audio_duration - hold_s
+    n = 0
+    for w in words:
+        if w["end"] <= cutoff:
+            n += 1
+        else:
+            break
+    return n
+
+
+class WordStreamer:
+    """
+    Feed live frames; types words as they stabilise. Runs its own worker thread
+    that periodically transcribes the pending audio. transcribe_words_fn must
+    have signature (audio, initial_prompt) -> [{word,start,end}, ...].
+    """
+
+    def __init__(
+        self,
+        transcribe_words_fn,
+        on_text,
+        sample_rate: int = SAMPLE_RATE,
+        interval_s: float = 0.5,
+        hold_s: float = 0.4,
+        retrim_s: float = 4.0,
+        context_chars: int = 200,
+    ) -> None:
+        self._tx = transcribe_words_fn
+        self._on_text = on_text
+        self.sr = sample_rate
+        self.interval_s = interval_s
+        self.hold_s = hold_s
+        self.retrim_s = retrim_s
+        self._context_chars = context_chars
+        self._buf: list[np.ndarray] = []
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread: threading.Thread | None = None
+        self._committed = 0   # words already typed from the current (untrimmed) buffer
+        self._prompt = ""     # committed text history for context
+
+    def feed(self, frame: np.ndarray) -> None:
+        with self._lock:
+            self._buf.append(np.asarray(frame, dtype=np.float32).flatten())
+
+    def _snapshot(self) -> np.ndarray:
+        with self._lock:
+            if not self._buf:
+                return np.zeros(0, dtype=np.float32)
+            return np.concatenate(self._buf).flatten()
+
+    def _trim_to(self, sample_idx: int) -> None:
+        with self._lock:
+            audio = np.concatenate(self._buf).flatten() if self._buf else np.zeros(0, np.float32)
+            audio = audio[sample_idx:]
+            self._buf = [audio] if audio.size else []
+
+    def _emit(self, new_words: list[dict]) -> None:
+        text = "".join(w["word"] for w in new_words)
+        if text:
+            self._on_text(text)
+            self._prompt = (self._prompt + text)[-self._context_chars :]
+
+    def _tick(self, final: bool) -> None:
+        audio = self._snapshot()
+        dur = audio.size / self.sr
+        if dur < 0.3:
+            return
+        words = self._tx(audio, self._prompt or None)
+        if not words:
+            return
+        n = len(words) if final else stable_word_count(words, dur, self.hold_s)
+        if n > self._committed:
+            self._emit(words[self._committed:n])
+            self._committed = n
+        # bound cost: once the buffer is long, drop the committed prefix audio
+        if not final and dur > self.retrim_s and 0 < self._committed <= len(words):
+            cut_end = words[self._committed - 1]["end"]
+            self._trim_to(int(cut_end * self.sr))
+            self._committed = 0
+
+    def _loop(self) -> None:
+        while self._running:
+            time.sleep(self.interval_s)
+            try:
+                self._tick(final=False)
+            except Exception as e:  # noqa: BLE001
+                print(f"[word] tick error: {e}", flush=True)
+
+    def start(self) -> None:
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+            self._thread = None
+        self._tick(final=True)  # flush remaining words
 
 
 # ---------------------------------------------------------------------------
