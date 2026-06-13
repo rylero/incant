@@ -18,10 +18,14 @@ from pathlib import Path
 import numpy as np
 import keyboard
 import customtkinter as ctk
+from PIL import Image
 
 import stt  # sets up CUDA DLLs on import
 
 SETTINGS_PATH = Path(__file__).with_name("settings.json")
+ASSETS = Path(__file__).with_name("assets")
+ICON_PNG = ASSETS / "incant.png"
+ICON_ICO = ASSETS / "incant.ico"
 
 MODELS = {
     "small · fastest": "small",
@@ -103,8 +107,12 @@ class App:
         self.adv_open = False
 
         root.title("incant")
-        root.geometry("540x500")
-        root.minsize(500, 460)
+        root.geometry("540x620")
+        root.minsize(420, 380)
+        try:
+            root.iconbitmap(str(ICON_ICO))
+        except Exception:  # noqa: BLE001
+            pass
 
         self._build_ui()
         self.bind_hotkey(self.settings["hotkey"])
@@ -120,25 +128,38 @@ class App:
     def _build_ui(self) -> None:
         root = self.root
         root.grid_columnconfigure(0, weight=1)
+        root.grid_rowconfigure(1, weight=1)  # body scrolls
         PADX = 22
 
-        # --- Header (title + Activity button) -------------------------------
+        # --- Header (logo + title + Activity button) ------------------------
         header = ctk.CTkFrame(root, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", padx=PADX, pady=(20, 6))
-        header.grid_columnconfigure(0, weight=1)
+        header.grid(row=0, column=0, sticky="ew", padx=PADX, pady=(18, 4))
+        header.grid_columnconfigure(1, weight=1)
+        try:
+            self.logo_img = ctk.CTkImage(Image.open(ICON_PNG), size=(50, 50))
+            ctk.CTkLabel(header, image=self.logo_img, text="").grid(
+                row=0, column=0, sticky="w", padx=(0, 12))
+        except Exception:  # noqa: BLE001
+            self.logo_img = None
         titles = ctk.CTkFrame(header, fg_color="transparent")
-        titles.grid(row=0, column=0, sticky="w")
+        titles.grid(row=0, column=1, sticky="w")
         ctk.CTkLabel(titles, text="incant",
-                     font=ctk.CTkFont(size=30, weight="bold")).pack(anchor="w")
+                     font=ctk.CTkFont(size=28, weight="bold")).pack(anchor="w")
         ctk.CTkLabel(titles, text="local voice → text", text_color="#7a7a7a",
-                     font=ctk.CTkFont(size=13)).pack(anchor="w")
+                     font=ctk.CTkFont(size=12)).pack(anchor="w")
         ctk.CTkButton(header, text="Activity", width=84, height=30,
                       fg_color="#2b2b2b", hover_color="#3a3a3a",
-                      command=self.open_log_window).grid(row=0, column=1, sticky="e")
+                      command=self.open_log_window).grid(row=0, column=2, sticky="e")
+
+        # --- Scrollable body (so Advanced scrolls on small windows) ---------
+        body = ctk.CTkScrollableFrame(root, fg_color="transparent")
+        body.grid(row=1, column=0, sticky="nsew", padx=(PADX - 12), pady=0)
+        body.grid_columnconfigure(0, weight=1)
+        IPADX = 10  # inner padding inside the scroll area
 
         # --- Status pill ----------------------------------------------------
-        pill = ctk.CTkFrame(root, corner_radius=10)
-        pill.grid(row=1, column=0, sticky="ew", padx=PADX, pady=(10, 6))
+        pill = ctk.CTkFrame(body, corner_radius=10)
+        pill.grid(row=0, column=0, sticky="ew", padx=IPADX, pady=(4, 6))
         self.dot = ctk.CTkLabel(pill, text="●", font=ctk.CTkFont(size=18),
                                 text_color="#e0a106", width=22)
         self.dot.pack(side="left", padx=(14, 4), pady=10)
@@ -147,8 +168,8 @@ class App:
                      font=ctk.CTkFont(size=14, weight="bold")).pack(side="left", pady=10)
 
         # --- Settings card --------------------------------------------------
-        card = ctk.CTkFrame(root, corner_radius=12)
-        card.grid(row=2, column=0, sticky="ew", padx=PADX, pady=6)
+        card = ctk.CTkFrame(body, corner_radius=12)
+        card.grid(row=1, column=0, sticky="ew", padx=IPADX, pady=6)
         card.grid_columnconfigure(1, weight=1)
 
         def label(parent, text, row):
@@ -195,13 +216,13 @@ class App:
 
         # --- Advanced (collapsible) ----------------------------------------
         self.adv_btn = ctk.CTkButton(
-            root, text="▸  Advanced", anchor="w", height=32,
+            body, text="▸  Advanced", anchor="w", height=32,
             fg_color="transparent", hover_color="#2b2b2b", text_color="#b0b0b0",
             command=self._toggle_advanced)
-        self.adv_btn.grid(row=3, column=0, sticky="ew", padx=PADX, pady=(8, 0))
+        self.adv_btn.grid(row=2, column=0, sticky="ew", padx=IPADX, pady=(8, 0))
 
-        self.adv = ctk.CTkFrame(root, corner_radius=12)
-        self.adv.grid(row=4, column=0, sticky="ew", padx=PADX, pady=(4, 6))
+        self.adv = ctk.CTkFrame(body, corner_radius=12)
+        self.adv.grid(row=3, column=0, sticky="ew", padx=IPADX, pady=(4, 6))
         self.adv.grid_columnconfigure(1, weight=1)
         self.adv.grid_remove()  # hidden until expanded
 
@@ -225,9 +246,9 @@ class App:
 
         # --- Footer ---------------------------------------------------------
         ctk.CTkLabel(
-            root, text="Keep this window open (minimize it). Hotkey works globally.",
+            body, text="Keep this window open (minimize it). Hotkey works globally.",
             text_color="#5f5f5f", font=ctk.CTkFont(size=11)).grid(
-            row=5, column=0, pady=(4, 12))
+            row=4, column=0, pady=(8, 12))
 
     def _adv_slider(self, parent, row, name, var, lo, hi, steps, fmt, hint):
         ctk.CTkLabel(parent, text=name, font=ctk.CTkFont(size=13),
@@ -252,11 +273,9 @@ class App:
         if self.adv_open:
             self.adv.grid()
             self.adv_btn.configure(text="▾  Advanced")
-            self.root.geometry("540x760")
         else:
             self.adv.grid_remove()
             self.adv_btn.configure(text="▸  Advanced")
-            self.root.geometry("540x500")
 
     def _on_adv_change(self, val_lbl, fmt, var) -> None:
         val_lbl.configure(text=fmt(var.get()))
@@ -271,6 +290,10 @@ class App:
         win = ctk.CTkToplevel(self.root)
         win.title("incant — activity")
         win.geometry("560x420")
+        try:
+            win.after(250, lambda: win.iconbitmap(str(ICON_ICO)))
+        except Exception:  # noqa: BLE001
+            pass
         win.grid_columnconfigure(0, weight=1)
         win.grid_rowconfigure(0, weight=1)
         box = ctk.CTkTextbox(win, font=ctk.CTkFont(family="Consolas", size=12), wrap="word")

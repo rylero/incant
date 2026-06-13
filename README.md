@@ -1,6 +1,7 @@
-# speechtotext
+# incant
 
-Push a hotkey, talk, get text typed at your cursor. Fully local — uses
+Local-first voice transcription. Push a hotkey, talk, get text typed at your
+cursor. Fully local — uses
 [faster-whisper](https://github.com/SYSTRAN/faster-whisper) `large-v3` on your
 GPU. No cloud, no API key, top-tier accuracy.
 

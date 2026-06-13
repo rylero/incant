@@ -9,6 +9,7 @@ dependencies = [
     "numpy>=1.26",
     "keyboard>=0.13.5",
     "customtkinter>=5.2.2",
+    "pillow>=10.0",
     # CUDA 12 + cuDNN 9 runtime for CTranslate2 GPU (works on RTX 5070 Ti / Blackwell)
     "nvidia-cublas-cu12>=12.4",
     "nvidia-cudnn-cu12>=9.0",

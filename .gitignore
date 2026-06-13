@@ -20,3 +20,6 @@ models/
 Thumbs.db
 .vscode/
 .idea/
+
+# AI assistant artifacts
+context-snapshot.json
