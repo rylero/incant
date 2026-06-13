@@ -11,6 +11,7 @@ Run:  uv run stt
 from __future__ import annotations
 
 import os
+import re
 import sys
 import glob
 import time
@@ -178,8 +179,26 @@ class AudioEngine:
             self._stream = None
 
 
-def transcribe_audio(model: WhisperModel, audio: np.ndarray, language: str | None):
-    """Run Whisper on a mono 16k float32 array. Returns (text, language)."""
+# Whisper writes "..." or the unicode ellipsis to mark trailing-off / hesitant
+# speech. In dictation that is almost always noise, so strip it.
+_ELLIPSIS = re.compile(r"\s*(?:\.{2,}|…)\s*")
+
+
+def clean_text(text: str) -> str:
+    """Remove hesitation ellipses and tidy whitespace/stray leading punctuation."""
+    text = _ELLIPSIS.sub(" ", text)
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    text = re.sub(r"^[,;:\-\s]+", "", text)  # drop a stray leading comma/dash
+    return text.strip()
+
+
+def transcribe_audio(
+    model: WhisperModel,
+    audio: np.ndarray,
+    language: str | None,
+    initial_prompt: str | None = None,
+):
+    """Run Whisper on a mono 16k float32 array. Returns (clean_text, language)."""
     if audio.size < SAMPLE_RATE * 0.3:  # <0.3s -> nothing useful
         return "", None
     # Pad ~0.2s of silence at the front: Whisper occasionally drops the first
@@ -191,11 +210,42 @@ def transcribe_audio(model: WhisperModel, audio: np.ndarray, language: str | Non
         audio,
         language=language,
         beam_size=5,
+        initial_prompt=initial_prompt,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=300, speech_pad_ms=600),
     )
     text = "".join(seg.text for seg in segments).strip()
-    return text, info.language
+    return clean_text(text), info.language
+
+
+class TextStitcher:
+    """
+    Joins phrase-by-phrase transcripts (continuous mode) into clean text.
+
+    - Separates phrases with a single space.
+    - Tracks the tail of emitted text to feed back as Whisper's initial_prompt
+      so the next phrase is transcribed with preceding context (better
+      continuity and capitalization than transcribing each phrase cold).
+    """
+
+    def __init__(self, context_chars: int = 160) -> None:
+        self._emitted = ""
+        self._context_chars = context_chars
+
+    @property
+    def prompt(self) -> str | None:
+        """Preceding context to bias the next phrase (None if nothing yet)."""
+        tail = self._emitted[-self._context_chars :].strip()
+        return tail or None
+
+    def next(self, phrase: str) -> str:
+        """Return the text to type for this phrase (incl. leading space)."""
+        phrase = clean_text(phrase)
+        if not phrase:
+            return ""
+        prefix = " " if self._emitted else ""
+        self._emitted += prefix + phrase
+        return prefix + phrase
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +264,7 @@ class PhraseSegmenter:
         on_phrase,
         sample_rate: int = SAMPLE_RATE,
         silence_rms: float = 0.012,
-        min_silence_s: float = 0.6,
+        min_silence_s: float = 0.8,
         min_phrase_s: float = 0.3,
         max_phrase_s: float = 20.0,
     ) -> None:

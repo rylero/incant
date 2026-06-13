@@ -72,6 +72,7 @@ class App:
         # continuous-mode state
         self.continuous_on = False
         self.segmenter: stt.PhraseSegmenter | None = None
+        self.stitcher: stt.TextStitcher | None = None
         self.phrase_queue: queue.Queue = queue.Queue()
         self.phrase_worker: threading.Thread | None = None
 
@@ -260,7 +261,11 @@ class App:
     # --- continuous mode (type phrase-by-phrase on pauses) -----------------
     def _toggle_continuous(self) -> None:
         if not self.continuous_on:
-            self.segmenter = stt.PhraseSegmenter(on_phrase=self.phrase_queue.put)
+            # 1.0s gap so mid-sentence thinking pauses don't split sentences
+            self.segmenter = stt.PhraseSegmenter(
+                on_phrase=self.phrase_queue.put, min_silence_s=1.0
+            )
+            self.stitcher = stt.TextStitcher()
             # prime with pre-roll so the very first phrase keeps its onset
             for f in (self.engine.preroll_audio(),):
                 if f.size:
@@ -289,11 +294,15 @@ class App:
                 return
             try:
                 lang = self.lang_var.get().strip() or None
+                prompt = self.stitcher.prompt  # preceding text for continuity
                 with self.model_lock:
-                    text, detected = stt.transcribe_audio(self.model, audio, lang)
-                if text:
+                    text, detected = stt.transcribe_audio(
+                        self.model, audio, lang, initial_prompt=prompt
+                    )
+                out = self.stitcher.next(text)
+                if out:
                     self.log_line(f"[{detected}] {text}")
-                    keyboard.write(text + " ", delay=0)
+                    keyboard.write(out, delay=0)
             except Exception as e:  # noqa: BLE001
                 self.log_line(f"[stt] phrase error: {e}")
 
