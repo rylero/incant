@@ -164,9 +164,14 @@ class App:
                      font=ctk.CTkFont(size=28, weight="bold")).pack(anchor="w")
         ctk.CTkLabel(titles, text="local voice → text", text_color="#7a7a7a",
                      font=ctk.CTkFont(size=12)).pack(anchor="w")
-        ctk.CTkButton(header, text="Activity", width=84, height=30,
+        header_btns = ctk.CTkFrame(header, fg_color="transparent")
+        header_btns.grid(row=0, column=2, sticky="e")
+        ctk.CTkButton(header_btns, text="Pipelines", width=84, height=30,
                       fg_color="#2b2b2b", hover_color="#3a3a3a",
-                      command=self.open_log_window).grid(row=0, column=2, sticky="e")
+                      command=self.open_pipeline_editor).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(header_btns, text="Activity", width=84, height=30,
+                      fg_color="#2b2b2b", hover_color="#3a3a3a",
+                      command=self.open_log_window).pack(side="left")
 
         # --- Scrollable body (so Advanced scrolls on small windows) ---------
         body = ctk.CTkScrollableFrame(root, fg_color="transparent")
@@ -194,8 +199,8 @@ class App:
                          text_color="#b0b0b0", anchor="w").grid(
                 row=row, column=0, sticky="w", padx=(16, 10), pady=11)
 
-        # Hotkey
-        label(card, "Hotkey", 0)
+        # Dictation hotkey
+        label(card, "Dictation", 0)
         hk_row = ctk.CTkFrame(card, fg_color="transparent")
         hk_row.grid(row=0, column=1, sticky="ew", padx=(0, 14), pady=8)
         hk_row.grid_columnconfigure(0, weight=1)
@@ -206,35 +211,10 @@ class App:
                                      command=self.capture_hotkey)
         self.set_btn.grid(row=0, column=1)
 
-        # Model
-        label(card, "Model", 1)
-        cur_model = next((k for k, v in MODELS.items() if v == self.settings["model"]),
-                         list(MODELS)[-1])
-        self.model_menu = ctk.CTkOptionMenu(card, values=list(MODELS),
-                                            command=lambda _v: self.reload_model())
-        self.model_menu.set(cur_model)
-        self.model_menu.grid(row=1, column=1, sticky="ew", padx=(0, 14), pady=8)
-
-        # Typing mode
-        label(card, "Typing", 2)
-        cur_out = next((k for k, v in OUTPUT_MODES.items()
-                        if v == self.settings.get("output_mode")), list(OUTPUT_MODES)[0])
-        self.output_seg = ctk.CTkSegmentedButton(card, values=list(OUTPUT_MODES),
-                                                 command=lambda _v: self.persist())
-        self.output_seg.set(cur_out)
-        self.output_seg.grid(row=2, column=1, sticky="ew", padx=(0, 14), pady=8)
-
-        # Language
-        label(card, "Language", 3)
-        self.lang_menu = ctk.CTkOptionMenu(card, values=LANGS, width=120,
-                                           command=lambda _v: self.persist())
-        self.lang_menu.set(self.settings.get("language") or "auto")
-        self.lang_menu.grid(row=3, column=1, sticky="w", padx=(0, 14), pady=8)
-
         # Command hotkey — enters command mode (routes speech to a pipeline)
-        label(card, "Command", 4)
+        label(card, "Command", 1)
         cmd_row = ctk.CTkFrame(card, fg_color="transparent")
-        cmd_row.grid(row=4, column=1, sticky="ew", padx=(0, 14), pady=8)
+        cmd_row.grid(row=1, column=1, sticky="ew", padx=(0, 14), pady=8)
         cmd_row.grid_columnconfigure(0, weight=1)
         self.command_hotkey_var = ctk.StringVar(value=self.settings["command_hotkey"])
         self.command_entry = ctk.CTkEntry(cmd_row, textvariable=self.command_hotkey_var)
@@ -242,6 +222,31 @@ class App:
         self.cmd_set_btn = ctk.CTkButton(cmd_row, text="Set", width=64,
                                          command=self.capture_command_hotkey)
         self.cmd_set_btn.grid(row=0, column=1)
+
+        # Model
+        label(card, "Model", 2)
+        cur_model = next((k for k, v in MODELS.items() if v == self.settings["model"]),
+                         list(MODELS)[-1])
+        self.model_menu = ctk.CTkOptionMenu(card, values=list(MODELS),
+                                            command=lambda _v: self.reload_model())
+        self.model_menu.set(cur_model)
+        self.model_menu.grid(row=2, column=1, sticky="ew", padx=(0, 14), pady=8)
+
+        # Typing mode
+        label(card, "Typing", 3)
+        cur_out = next((k for k, v in OUTPUT_MODES.items()
+                        if v == self.settings.get("output_mode")), list(OUTPUT_MODES)[0])
+        self.output_seg = ctk.CTkSegmentedButton(card, values=list(OUTPUT_MODES),
+                                                 command=lambda _v: self.persist())
+        self.output_seg.set(cur_out)
+        self.output_seg.grid(row=3, column=1, sticky="ew", padx=(0, 14), pady=8)
+
+        # Language
+        label(card, "Language", 4)
+        self.lang_menu = ctk.CTkOptionMenu(card, values=LANGS, width=120,
+                                           command=lambda _v: self.persist())
+        self.lang_menu.set(self.settings.get("language") or "auto")
+        self.lang_menu.grid(row=4, column=1, sticky="w", padx=(0, 14), pady=8)
 
         # --- Advanced (collapsible) ----------------------------------------
         self.adv_btn = ctk.CTkButton(
@@ -335,6 +340,28 @@ class App:
         def _closed():
             self._log_win = None
             self._log_box = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", _closed)
+
+    def open_pipeline_editor(self) -> None:
+        if getattr(self, "_editor_win", None) is not None and self._editor_win.winfo_exists():
+            self._editor_win.focus()
+            return
+        from automation.editor import PipelineEditor
+
+        win = ctk.CTkToplevel(self.root)
+        win.title("incant — Pipeline Editor")
+        win.geometry("1100x680")
+        try:
+            win.after(250, lambda: win.iconbitmap(str(ICON_ICO)))
+        except Exception:  # noqa: BLE001
+            pass
+        PipelineEditor(win).pack(fill="both", expand=True)
+        self._editor_win = win
+
+        def _closed():
+            self._editor_win = None
             win.destroy()
 
         win.protocol("WM_DELETE_WINDOW", _closed)

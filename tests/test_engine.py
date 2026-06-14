@@ -224,3 +224,16 @@ def test_manifest_round_trip(tmp_path: Path):
     assert again.node("ai").system_prompt == "be concise"
     assert again.node("mail").delay_until_finished is True
     assert again.edges[0].handle == "in"
+
+
+def test_manifest_persists_editor_layout(tmp_path: Path):
+    pipe = Pipeline(
+        name="Laid Out", when_to_use="",
+        nodes=[Node(id="a", type="ai", x=60, y=120),
+               Node(id="b", type="type_cursor", x=300, y=120)],
+        edges=[Edge("a", "b", "in")],
+    )
+    folder = save_pipeline(pipe, tmp_path / "layout")
+    again = load_pipeline(folder)
+    assert (again.node("a").x, again.node("a").y) == (60, 120)
+    assert (again.node("b").x, again.node("b").y) == (300, 120)

@@ -28,6 +28,8 @@ class Node:
     guard: bool = False                        # pause for human review before running
     delay_until_finished: bool = False         # defer irreversible step to the end
     system_prompt: str = ""                     # AI steps only; loaded from prompts/<id>.md
+    x: int = 0                                  # editor-only: canvas layout position
+    y: int = 0                                  # editor-only: canvas layout position
 
 
 @dataclass
@@ -82,6 +84,8 @@ def load_pipeline(folder: str | Path) -> Pipeline:
             config=nd.get("config", {}),
             guard=nd.get("guard", False),
             delay_until_finished=nd.get("delay_until_finished", False),
+            x=nd.get("x", 0),
+            y=nd.get("y", 0),
         )
         prompt_file = folder / "prompts" / f"{node.id}.md"
         if prompt_file.exists():
@@ -115,6 +119,8 @@ def save_pipeline(pipeline: Pipeline, folder: str | Path | None = None) -> Path:
                 "config": n.config,
                 "guard": n.guard,
                 "delay_until_finished": n.delay_until_finished,
+                "x": n.x,
+                "y": n.y,
             }
             for n in pipeline.nodes
         ],
