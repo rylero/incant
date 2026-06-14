@@ -10,9 +10,13 @@ Run:  uv run ui
 
 from __future__ import annotations
 
+import ctypes
 import json
+import math
 import queue
+import random
 import threading
+import tkinter as tk
 from pathlib import Path
 
 import numpy as np
@@ -75,8 +79,64 @@ STATUS_COLORS = {
     "error": "#e74c3c",
 }
 
+# Dark palette — near-black, darker than CTk's default dark-mode grays.
+BG = "#101010"          # root window background
+SURFACE = "#1a1a1a"      # cards / pill / advanced panel
+SURFACE_ALT = "#242424"  # buttons
+HOVER = "#2f2f2f"        # button hover
+
+# Overlay pill: small always-on-top waveform HUD shown while transcribing.
+OVERLAY_W = 180
+OVERLAY_H = 70
+OVERLAY_BARS = 10
+OVERLAY_BAR_WIDTH = 10
+OVERLAY_PAD = 22
+OVERLAY_MARGIN_BOTTOM = 56
+OVERLAY_BG = "#0d0d0d"
+OVERLAY_GAIN = 4.0  # multiplies sqrt(rms) before mapping to bar height
+OVERLAY_KEY = "#fe01fe"  # chroma-key color -> transparent (Windows -transparentcolor)
+
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
+
+
+def _rounded_rect(canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: float, r: float, **kwargs):
+    points = [
+        x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+        x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+        x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
+    ]
+    return canvas.create_polygon(points, smooth=True, **kwargs)
+
+
+def _monitor_work_area(hwnd: int) -> tuple[int, int, int, int]:
+    """Work-area rect (left, top, right, bottom) of the monitor containing hwnd.
+
+    winfo_screenwidth/height always report the *primary* monitor, which
+    places the overlay off-screen on multi-monitor setups where the app
+    isn't on the primary display. This follows the app window instead.
+    """
+    MONITOR_DEFAULTTONEAREST = 2
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long), ("top", ctypes.c_long),
+            ("right", ctypes.c_long), ("bottom", ctypes.c_long),
+        ]
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", ctypes.c_ulong), ("rcMonitor", RECT),
+            ("rcWork", RECT), ("dwFlags", ctypes.c_ulong),
+        ]
+
+    user32 = ctypes.windll.user32
+    hmon = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+    mi = MONITORINFO()
+    mi.cbSize = ctypes.sizeof(MONITORINFO)
+    user32.GetMonitorInfoW(hmon, ctypes.byref(mi))
+    r = mi.rcWork
+    return r.left, r.top, r.right, r.bottom
 
 
 def load_settings() -> dict:
@@ -134,12 +194,14 @@ class App:
         root.title("incant")
         root.geometry("540x620")
         root.minsize(420, 380)
+        root.configure(fg_color=BG)
         try:
             root.iconbitmap(str(ICON_ICO))
         except Exception:  # noqa: BLE001
             pass
 
         self._build_ui()
+        self._build_overlay()
         self.bind_hotkey(self.settings["hotkey"])
         self.bind_command_hotkey(self.settings["command_hotkey"])
         try:
@@ -148,6 +210,7 @@ class App:
             self.log_line(f"[audio] could not open mic: {e}")
         self.reload_model()
         self.root.after(80, self._drain_queue)
+        self.root.after(50, self._overlay_tick)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         start_notifier()
 
@@ -187,8 +250,8 @@ class App:
             text="Activity",
             width=84,
             height=30,
-            fg_color="#2b2b2b",
-            hover_color="#3a3a3a",
+            fg_color=SURFACE_ALT,
+            hover_color=HOVER,
             command=self.open_log_window,
         ).pack(side="left")
 
@@ -199,7 +262,7 @@ class App:
         IPADX = 10  # inner padding inside the scroll area
 
         # --- Status pill ----------------------------------------------------
-        pill = ctk.CTkFrame(body, corner_radius=10)
+        pill = ctk.CTkFrame(body, corner_radius=10, fg_color=SURFACE)
         pill.grid(row=0, column=0, sticky="ew", padx=IPADX, pady=(4, 6))
         self.dot = ctk.CTkLabel(
             pill, text="●", font=ctk.CTkFont(size=18), text_color="#e0a106", width=22
@@ -211,7 +274,7 @@ class App:
         ).pack(side="left", pady=10)
 
         # --- Settings card --------------------------------------------------
-        card = ctk.CTkFrame(body, corner_radius=12)
+        card = ctk.CTkFrame(body, corner_radius=12, fg_color=SURFACE)
         card.grid(row=1, column=0, sticky="ew", padx=IPADX, pady=6)
         card.grid_columnconfigure(1, weight=1)
 
@@ -306,13 +369,13 @@ class App:
             anchor="w",
             height=32,
             fg_color="transparent",
-            hover_color="#2b2b2b",
+            hover_color=SURFACE_ALT,
             text_color="#b0b0b0",
             command=self._toggle_advanced,
         )
         self.adv_btn.grid(row=2, column=0, sticky="ew", padx=IPADX, pady=(8, 0))
 
-        self.adv = ctk.CTkFrame(body, corner_radius=12)
+        self.adv = ctk.CTkFrame(body, corner_radius=12, fg_color=SURFACE)
         self.adv.grid(row=3, column=0, sticky="ew", padx=IPADX, pady=(4, 6))
         self.adv.grid_columnconfigure(1, weight=1)
         self.adv.grid_remove()  # hidden until expanded
@@ -423,7 +486,7 @@ class App:
         if self._log_win is not None and self._log_win.winfo_exists():
             self._log_win.focus()
             return
-        win = ctk.CTkToplevel(self.root)
+        win = ctk.CTkToplevel(self.root, fg_color=BG)
         win.title("incant — activity")
         win.geometry("560x420")
         try:
@@ -494,7 +557,7 @@ class App:
 
     def _show_approval_dialog(self, req: ApprovalRequest) -> None:
         """Modal popup: show the action details and let the user Approve / Reject."""
-        win = ctk.CTkToplevel(self.root)
+        win = ctk.CTkToplevel(self.root, fg_color=BG)
         win.title(req.title)
         win.geometry("480x360")
         win.minsize(420, 300)
@@ -537,6 +600,107 @@ class App:
         label = "approved" if approved else "rejected"
         self.log_line(f"[approval] {approval_id[:8]}… {label}")
         respond_approval(approval_id, approved)
+
+    # --------------------------------------------------------------- overlay
+    def _build_overlay(self) -> None:
+        """Borderless always-on-top pill showing a live waveform while
+        transcription is on. Click-through so it never steals focus."""
+        win = tk.Toplevel(self.root)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=OVERLAY_KEY)
+        win.attributes("-transparentcolor", OVERLAY_KEY)
+
+        canvas = tk.Canvas(
+            win,
+            width=OVERLAY_W,
+            height=OVERLAY_H,
+            bg=OVERLAY_KEY,
+            highlightthickness=0,
+            bd=0,
+        )
+        canvas.pack()
+
+        win.update_idletasks()
+        try:
+            left, top, right, bottom = _monitor_work_area(self.root.winfo_id())
+        except Exception:  # noqa: BLE001
+            left, top = 0, 0
+            right, bottom = win.winfo_screenwidth(), win.winfo_screenheight()
+        x = left + (right - left - OVERLAY_W) // 2
+        y = bottom - OVERLAY_H - OVERLAY_MARGIN_BOTTOM
+        win.geometry(f"{OVERLAY_W}x{OVERLAY_H}+{x}+{y}")
+
+        _rounded_rect(
+            canvas, 1, 1, OVERLAY_W - 1, OVERLAY_H - 1, OVERLAY_H // 2,
+            fill=OVERLAY_BG, outline="",
+        )
+
+        cy = OVERLAY_H / 2
+        usable = OVERLAY_W - 2 * OVERLAY_PAD
+        bars = []
+        for i in range(OVERLAY_BARS):
+            bx = OVERLAY_PAD + i * usable / (OVERLAY_BARS - 1)
+            bar = canvas.create_line(
+                bx, cy - 2, bx, cy + 2, fill="white", width=OVERLAY_BAR_WIDTH, capstyle=tk.ROUND
+            )
+            bars.append((bar, bx))
+
+        self._overlay_win = win
+        self._overlay_canvas = canvas
+        self._overlay_bars = bars
+        # Per-bar amplitude weights so all bars pulse with the same audio
+        # level but at different relative heights (static EQ look, no scroll).
+        self._overlay_weights = [random.uniform(0.5, 1.4) for _ in range(OVERLAY_BARS)]
+        self._overlay_visible = False
+        self._make_clickthrough(win)
+
+    def _make_clickthrough(self, win: tk.Toplevel) -> None:
+        """Make the overlay ignore mouse/keyboard so it never steals focus."""
+        try:
+            GWL_EXSTYLE = -20
+            WS_EX_LAYERED = 0x00080000
+            WS_EX_TRANSPARENT = 0x00000020
+            WS_EX_NOACTIVATE = 0x08000000
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetParent(win.winfo_id()) or win.winfo_id()
+            styles = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            user32.SetWindowLongW(
+                hwnd,
+                GWL_EXSTYLE,
+                styles | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+            )
+        except Exception as e:  # noqa: BLE001
+            self.log_line(f"[overlay] click-through unavailable: {e}")
+
+    def _overlay_should_show(self) -> bool:
+        return (
+            self.continuous_on
+            or self.word_streamer is not None
+            or self.engine.capturing
+        )
+
+    def _overlay_tick(self) -> None:
+        show = self._overlay_should_show()
+        if show and not self._overlay_visible:
+            self._overlay_win.deiconify()
+            self._overlay_visible = True
+        elif not show and self._overlay_visible:
+            self._overlay_win.withdraw()
+            self._overlay_visible = False
+
+        if show:
+            recent = self.engine.recent_levels(3)
+            level = sum(recent) / len(recent) if recent else 0.0
+            cy = OVERLAY_H / 2
+            min_h, max_h = 4.0, OVERLAY_H - 2 * OVERLAY_BAR_WIDTH
+            for (bar, bx), weight in zip(self._overlay_bars, self._overlay_weights):
+                frac = min(1.0, math.sqrt(max(0.0, level)) * OVERLAY_GAIN * weight)
+                h = min_h + (max_h - min_h) * frac
+                self._overlay_canvas.coords(bar, bx, cy - h / 2, bx, cy + h / 2)
+
+        self.root.after(50, self._overlay_tick)
 
     def persist(self) -> None:
         lang = self.lang_menu.get()

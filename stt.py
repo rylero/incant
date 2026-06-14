@@ -107,6 +107,7 @@ class AudioEngine:
         self.blocksize = blocksize
         ring_len = max(1, round(preroll_s * sample_rate / blocksize))
         self._ring: deque[np.ndarray] = deque(maxlen=ring_len)
+        self._levels: deque[float] = deque(maxlen=50)  # recent per-frame RMS, for UI waveform
         self._cap: list[np.ndarray] = []
         self._capturing = False
         self._on_frame = None  # optional live consumer (continuous mode)
@@ -116,13 +117,23 @@ class AudioEngine:
     # --- core (testable) ---------------------------------------------------
     def _ingest(self, frame: np.ndarray) -> None:
         frame = np.asarray(frame, dtype=np.float32).flatten()
+        rms = float(np.sqrt(np.mean(frame * frame))) if frame.size else 0.0
         with self._lock:
             self._ring.append(frame)
+            self._levels.append(rms)
             if self._capturing:
                 self._cap.append(frame)
             listener = self._on_frame
         if listener is not None:
             listener(frame)
+
+    def recent_levels(self, n: int) -> list[float]:
+        """Last n per-frame RMS values (left-padded with 0.0), for a UI waveform."""
+        with self._lock:
+            levels = list(self._levels)
+        if len(levels) < n:
+            levels = [0.0] * (n - len(levels)) + levels
+        return levels[-n:]
 
     def begin_capture(self) -> None:
         """Start collecting; seed with the pre-roll ring so the onset is kept."""
