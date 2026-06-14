@@ -22,10 +22,20 @@ from PIL import Image
 
 import stt  # sets up CUDA DLLs on import
 
+# Automation layer (command mode). Headless engine; the UI injects the
+# keyboard-typing hook and the guard popup. See automation/ and docs/adr/.
+from automation import Engine, GuardDecision
+from automation import router
+from automation.manifest import discover_pipelines
+from automation.actions import ActionContext
+from automation.payload import render as render_payload
+from automation.models import make_model, ModelError
+
 SETTINGS_PATH = Path(__file__).with_name("settings.json")
 ASSETS = Path(__file__).with_name("assets")
 ICON_PNG = ASSETS / "incant.png"
 ICON_ICO = ASSETS / "incant.ico"
+PIPELINES_DIR = Path(__file__).with_name("pipelines")
 
 MODELS = {
     "small · fastest": "small",
@@ -40,6 +50,7 @@ OUTPUT_MODES = {
 LANGS = ["auto", "en", "es", "fr", "de", "it", "pt", "zh", "ja"]
 DEFAULTS = {
     "hotkey": "ctrl+alt+space",
+    "command_hotkey": "ctrl+alt+c",
     "model": "large-v3",
     "language": "",
     "output_mode": "continuous",
@@ -94,6 +105,11 @@ class App:
         self.busy = threading.Event()
         self.hotkey_handle = None
         self.ui_queue: queue.Queue = queue.Queue()
+        # command mode (automation)
+        self.command_on = False
+        self.command_hotkey_handle = None
+        self.guard_event = threading.Event()
+        self._guard_decision = GuardDecision("approve")
         # mode state
         self.continuous_on = False
         self.segmenter: stt.PhraseSegmenter | None = None
@@ -116,6 +132,7 @@ class App:
 
         self._build_ui()
         self.bind_hotkey(self.settings["hotkey"])
+        self.bind_command_hotkey(self.settings["command_hotkey"])
         try:
             self.engine.start_stream()
         except Exception as e:  # noqa: BLE001
@@ -213,6 +230,18 @@ class App:
                                            command=lambda _v: self.persist())
         self.lang_menu.set(self.settings.get("language") or "auto")
         self.lang_menu.grid(row=3, column=1, sticky="w", padx=(0, 14), pady=8)
+
+        # Command hotkey — enters command mode (routes speech to a pipeline)
+        label(card, "Command", 4)
+        cmd_row = ctk.CTkFrame(card, fg_color="transparent")
+        cmd_row.grid(row=4, column=1, sticky="ew", padx=(0, 14), pady=8)
+        cmd_row.grid_columnconfigure(0, weight=1)
+        self.command_hotkey_var = ctk.StringVar(value=self.settings["command_hotkey"])
+        self.command_entry = ctk.CTkEntry(cmd_row, textvariable=self.command_hotkey_var)
+        self.command_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.cmd_set_btn = ctk.CTkButton(cmd_row, text="Set", width=64,
+                                         command=self.capture_command_hotkey)
+        self.cmd_set_btn.grid(row=0, column=1)
 
         # --- Advanced (collapsible) ----------------------------------------
         self.adv_btn = ctk.CTkButton(
@@ -326,6 +355,10 @@ class App:
                     self.dot.configure(text_color=_status_color(val))
                 elif kind == "enable_set":
                     self.set_btn.configure(state="normal", text="Set")
+                elif kind == "enable_cmd_set":
+                    self.cmd_set_btn.configure(state="normal", text="Set")
+                elif kind == "guard":
+                    self._open_guard_popup(val)
                 elif kind == "log":
                     self._log_lines.append(val)
                     del self._log_lines[:-500]  # cap history
@@ -342,6 +375,7 @@ class App:
         lang = self.lang_menu.get()
         self.settings.update(
             hotkey=self.hotkey_var.get().strip(),
+            command_hotkey=self.command_hotkey_var.get().strip(),
             model=MODELS[self.model_menu.get()],
             language="" if lang == "auto" else lang,
             output_mode=OUTPUT_MODES[self.output_seg.get()],
@@ -376,6 +410,34 @@ class App:
             self.persist()
             self.set_status("ready — press your hotkey to talk")
             self.ui_queue.put(("enable_set", None))
+
+        threading.Thread(target=grab, daemon=True).start()
+
+    # -------------------------------------------------------- command hotkey
+    def bind_command_hotkey(self, hk: str) -> None:
+        if self.command_hotkey_handle is not None:
+            try:
+                keyboard.remove_hotkey(self.command_hotkey_handle)
+            except (KeyError, ValueError):
+                pass
+        try:
+            self.command_hotkey_handle = keyboard.add_hotkey(
+                hk, self.toggle_command, suppress=False)
+            self.log_line(f"[hotkey] command bound to {hk}")
+        except Exception as e:  # noqa: BLE001
+            self.log_line(f"[hotkey] invalid command '{hk}': {e}")
+
+    def capture_command_hotkey(self) -> None:
+        self.cmd_set_btn.configure(state="disabled", text="press…")
+        self.set_status("press your command hotkey combo…")
+
+        def grab() -> None:
+            hk = keyboard.read_hotkey(suppress=False)
+            self.command_hotkey_var.set(hk)
+            self.bind_command_hotkey(hk)
+            self.persist()
+            self.set_status("ready — press your hotkey to talk")
+            self.ui_queue.put(("enable_cmd_set", None))
 
         threading.Thread(target=grab, daemon=True).start()
 
@@ -516,6 +578,112 @@ class App:
             self.word_streamer = None
             self.set_status("ready — press your hotkey to talk")
             self.log_line("[stt] word-by-word off")
+
+    # --------------------------------------------------------- command mode
+    def toggle_command(self) -> None:
+        """Push-to-talk for command mode: first press records, second runs."""
+        if self.model is None:
+            self.log_line("[cmd] model not ready yet")
+            return
+        if not self.command_on:
+            if (self.engine.capturing or self.busy.is_set()
+                    or self.continuous_on or self.word_streamer is not None):
+                self.log_line("[cmd] busy — finish dictation first")
+                return
+            self.engine.begin_capture()
+            self.command_on = True
+            self.set_status("● command… (hotkey again to run)")
+        else:
+            audio = self.engine.end_capture()
+            self.command_on = False
+            self.set_status("routing…")
+            threading.Thread(target=self._run_command, args=(audio,), daemon=True).start()
+
+    def _run_command(self, audio: np.ndarray) -> None:
+        try:
+            lang = self.settings.get("language") or None
+            with self.model_lock:
+                text, _ = stt.transcribe_audio(self.model, audio, lang, beam_size=self._beam())
+            if not text:
+                self.log_line("[cmd] (nothing heard)")
+                return
+            self.log_line(f"[cmd] heard: {text}")
+            pipes = discover_pipelines(PIPELINES_DIR)
+            routed = router.route(text, pipes)
+            if not routed.matched:
+                self.log_line(f"[cmd] no pipeline matched ({routed.reason}) — cleaning + typing")
+                self._clean_and_type(text)
+                return
+            self.log_line(f"[cmd] → {routed.pipeline.name}")
+            self.set_status(f"running {routed.pipeline.name}…")
+            ctx = ActionContext(
+                log=self.log_line,
+                type_text=lambda t: keyboard.write(t, delay=0),
+            )
+            result = Engine(ctx=ctx, guard=self._guard_handler).run(routed.pipeline, text)
+            self.log_line("[cmd] " + result.summary())
+        except Exception as e:  # noqa: BLE001
+            self.log_line(f"[cmd] error: {e}")
+        finally:
+            self.set_status("ready — press your hotkey to talk")
+
+    def _clean_and_type(self, text: str) -> None:
+        """No-route fallback: AI-clean the transcript and type it — never raw."""
+        try:
+            model = make_model(router.DEFAULT_ROUTER_MODEL)
+            cleaned = model.complete(
+                "Fix the grammar, capitalization and punctuation of this dictation. "
+                "Return ONLY the corrected text, nothing else.", text).strip()
+            keyboard.write((cleaned or text) + " ", delay=0)
+        except ModelError as e:
+            self.log_line(f"[cmd] AI clean unavailable ({e}); typing raw")
+            keyboard.write(text + " ", delay=0)
+
+    def _guard_handler(self, req) -> GuardDecision:
+        """Called on the engine thread; blocks until the UI popup answers."""
+        self._guard_decision = GuardDecision("approve")
+        self.guard_event.clear()
+        self.ui_queue.put(("guard", req))
+        self.guard_event.wait()
+        return self._guard_decision
+
+    def _open_guard_popup(self, req) -> None:
+        win = ctk.CTkToplevel(self.root)
+        win.title("incant — guard")
+        win.geometry("460x440")
+        win.attributes("-topmost", True)
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            win, text=f"Guard: {req.node.id} ({req.node.type})   →   next: {req.next_step}",
+            font=ctk.CTkFont(size=13, weight="bold"), anchor="w").grid(
+            row=0, column=0, sticky="ew", padx=14, pady=(12, 4))
+        box = ctk.CTkTextbox(win, wrap="word", font=ctk.CTkFont(family="Consolas", size=12))
+        box.grid(row=1, column=0, sticky="nsew", padx=14, pady=4)
+        box.insert("end", render_payload(req.inbound))
+        box.configure(state="disabled")
+        fb = ctk.CTkEntry(win, placeholder_text="refactor feedback (optional)")
+        fb.grid(row=2, column=0, sticky="ew", padx=14, pady=6)
+
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.grid(row=3, column=0, sticky="ew", padx=14, pady=(4, 12))
+
+        def decide(action: str) -> None:
+            if action == "refactor":
+                self._guard_decision = GuardDecision("refactor", fb.get().strip())
+            else:
+                self._guard_decision = GuardDecision(action)
+            self.guard_event.set()
+            win.destroy()
+
+        ctk.CTkButton(btns, text="Approve", fg_color="#2ecc71", hover_color="#27ae60",
+                      command=lambda: decide("approve")).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Refactor",
+                      command=lambda: decide("refactor")).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Stop", fg_color="#e74c3c", hover_color="#c0392b",
+                      command=lambda: decide("stop")).pack(side="left", padx=4)
+        win.protocol("WM_DELETE_WINDOW", lambda: decide("stop"))  # closing = safe stop
 
     # ------------------------------------------------------------- lifecycle
     def on_close(self) -> None:

@@ -1,0 +1,27 @@
+{
+  "name": "Save Note",
+  "when_to_use": "When the user dictates a thought, reminder, or note they want saved to their notes vault.",
+  "nodes": [
+    {
+      "id": "compose",
+      "type": "ai",
+      "config": { "model": { "backend": "claude", "model": "sonnet" } },
+      "guard": false,
+      "delay_until_finished": false
+    },
+    {
+      "id": "write",
+      "type": "save_file",
+      "config": {
+        "base_dir": "~/incant-notes",
+        "path_field": "path",
+        "content_field": "content"
+      },
+      "guard": false,
+      "delay_until_finished": false
+    }
+  ],
+  "edges": [
+    { "src": "compose", "dst": "write", "handle": "in" }
+  ]
+}

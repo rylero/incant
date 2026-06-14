@@ -11,6 +11,9 @@ venv/
 # App
 settings.json
 
+# Automation: named Credentials store (SMTP logins, etc.) — never commit
+.credentials.json
+
 # Whisper model cache (downloaded weights, multi-GB)
 *.bin
 models/

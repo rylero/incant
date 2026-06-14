@@ -18,6 +18,11 @@ dependencies = [
 [project.scripts]
 stt = "stt:main"
 ui = "ui:main"
+automation = "automation.cli:main"
 
 [tool.uv]
 # keep CUDA wheels; they are large but needed for GPU
+
+[tool.pytest.ini_options]
+pythonpath = ["."]      # make the flat-layout packages (automation, stt) importable
+testpaths = ["tests"]
