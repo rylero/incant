@@ -10,9 +10,11 @@ dependencies = [
     "keyboard>=0.13.5",
     "customtkinter>=5.2.2",
     "pillow>=10.0",
+    "httpx>=0.27.0",
     # CUDA 12 + cuDNN 9 runtime for CTranslate2 GPU (works on RTX 5070 Ti / Blackwell)
     "nvidia-cublas-cu12>=12.4",
     "nvidia-cudnn-cu12>=9.0",
+    "winotify>=1.1.0",
 ]
 
 [project.scripts]

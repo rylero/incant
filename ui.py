@@ -22,20 +22,22 @@ from PIL import Image
 
 import stt  # sets up CUDA DLLs on import
 
-# Automation layer (command mode). Headless engine; the UI injects the
-# keyboard-typing hook and the guard popup. See automation/ and docs/adr/.
-from automation import Engine, GuardDecision
-from automation import router
-from automation.manifest import discover_pipelines
-from automation.actions import ActionContext
-from automation.payload import render as render_payload
+# Automation layer (command mode): route a transcript to a registered n8n
+# workflow and fire its webhook. See automation/ and docs/adr/.
+from automation.command import run_command
 from automation.models import make_model, ModelError
+from automation.notifier import (
+    ApprovalRequest,
+    start as start_notifier,
+    stop as stop_notifier,
+    pop_approval,
+    respond_approval,
+)
 
 SETTINGS_PATH = Path(__file__).with_name("settings.json")
 ASSETS = Path(__file__).with_name("assets")
 ICON_PNG = ASSETS / "incant.png"
 ICON_ICO = ASSETS / "incant.ico"
-PIPELINES_DIR = Path(__file__).with_name("pipelines")
 
 MODELS = {
     "small · fastest": "small",
@@ -54,16 +56,23 @@ DEFAULTS = {
     "model": "large-v3",
     "language": "",
     "output_mode": "continuous",
-    "silence_s": 1.0,     # continuous pause-split gap
-    "beam_size": 5,       # accuracy vs speed
-    "preroll_s": 0.5,     # audio kept before keypress (first-word onset)
-    "mic_rms": 0.012,     # continuous silence gate (mic sensitivity)
+    "silence_s": 1.0,  # continuous pause-split gap
+    "beam_size": 5,  # accuracy vs speed
+    "preroll_s": 0.5,  # audio kept before keypress (first-word onset)
+    "mic_rms": 0.004,  # continuous silence gate (mic sensitivity)
+    "webhook_url": "",  # n8n webhook for command mode (empty = AI-clean + type)
 }
 
 STATUS_COLORS = {
-    "load": "#e0a106", "warm": "#e0a106", "ready": "#2ecc71",
-    "record": "#e74c3c", "listen": "#e74c3c", "transcrib": "#3498db",
-    "press": "#2ecc71", "fail": "#e74c3c", "error": "#e74c3c",
+    "load": "#e0a106",
+    "warm": "#e0a106",
+    "ready": "#2ecc71",
+    "record": "#e74c3c",
+    "listen": "#e74c3c",
+    "transcrib": "#3498db",
+    "press": "#2ecc71",
+    "fail": "#e74c3c",
+    "error": "#e74c3c",
 }
 
 ctk.set_appearance_mode("dark")
@@ -101,15 +110,15 @@ class App:
         self.settings = load_settings()
         self.model = None
         self.model_lock = threading.Lock()
-        self.engine = stt.AudioEngine(preroll_s=float(self.settings.get("preroll_s", 0.5)))
+        self.engine = stt.AudioEngine(
+            preroll_s=float(self.settings.get("preroll_s", 0.5))
+        )
         self.busy = threading.Event()
         self.hotkey_handle = None
         self.ui_queue: queue.Queue = queue.Queue()
         # command mode (automation)
         self.command_on = False
         self.command_hotkey_handle = None
-        self.guard_event = threading.Event()
-        self._guard_decision = GuardDecision("approve")
         # mode state
         self.continuous_on = False
         self.segmenter: stt.PhraseSegmenter | None = None
@@ -140,6 +149,7 @@ class App:
         self.reload_model()
         self.root.after(80, self._drain_queue)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        start_notifier()
 
     # ----------------------------------------------------------------- UI
     def _build_ui(self) -> None:
@@ -155,23 +165,32 @@ class App:
         try:
             self.logo_img = ctk.CTkImage(Image.open(ICON_PNG), size=(50, 50))
             ctk.CTkLabel(header, image=self.logo_img, text="").grid(
-                row=0, column=0, sticky="w", padx=(0, 12))
+                row=0, column=0, sticky="w", padx=(0, 12)
+            )
         except Exception:  # noqa: BLE001
             self.logo_img = None
         titles = ctk.CTkFrame(header, fg_color="transparent")
         titles.grid(row=0, column=1, sticky="w")
-        ctk.CTkLabel(titles, text="incant",
-                     font=ctk.CTkFont(size=28, weight="bold")).pack(anchor="w")
-        ctk.CTkLabel(titles, text="local voice → text", text_color="#7a7a7a",
-                     font=ctk.CTkFont(size=12)).pack(anchor="w")
+        ctk.CTkLabel(
+            titles, text="incant", font=ctk.CTkFont(size=28, weight="bold")
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            titles,
+            text="local voice → text",
+            text_color="#7a7a7a",
+            font=ctk.CTkFont(size=12),
+        ).pack(anchor="w")
         header_btns = ctk.CTkFrame(header, fg_color="transparent")
         header_btns.grid(row=0, column=2, sticky="e")
-        ctk.CTkButton(header_btns, text="Pipelines", width=84, height=30,
-                      fg_color="#2b2b2b", hover_color="#3a3a3a",
-                      command=self.open_pipeline_editor).pack(side="left", padx=(0, 6))
-        ctk.CTkButton(header_btns, text="Activity", width=84, height=30,
-                      fg_color="#2b2b2b", hover_color="#3a3a3a",
-                      command=self.open_log_window).pack(side="left")
+        ctk.CTkButton(
+            header_btns,
+            text="Activity",
+            width=84,
+            height=30,
+            fg_color="#2b2b2b",
+            hover_color="#3a3a3a",
+            command=self.open_log_window,
+        ).pack(side="left")
 
         # --- Scrollable body (so Advanced scrolls on small windows) ---------
         body = ctk.CTkScrollableFrame(root, fg_color="transparent")
@@ -182,12 +201,14 @@ class App:
         # --- Status pill ----------------------------------------------------
         pill = ctk.CTkFrame(body, corner_radius=10)
         pill.grid(row=0, column=0, sticky="ew", padx=IPADX, pady=(4, 6))
-        self.dot = ctk.CTkLabel(pill, text="●", font=ctk.CTkFont(size=18),
-                                text_color="#e0a106", width=22)
+        self.dot = ctk.CTkLabel(
+            pill, text="●", font=ctk.CTkFont(size=18), text_color="#e0a106", width=22
+        )
         self.dot.pack(side="left", padx=(14, 4), pady=10)
         self.status_var = ctk.StringVar(value="loading model…")
-        ctk.CTkLabel(pill, textvariable=self.status_var,
-                     font=ctk.CTkFont(size=14, weight="bold")).pack(side="left", pady=10)
+        ctk.CTkLabel(
+            pill, textvariable=self.status_var, font=ctk.CTkFont(size=14, weight="bold")
+        ).pack(side="left", pady=10)
 
         # --- Settings card --------------------------------------------------
         card = ctk.CTkFrame(body, corner_radius=12)
@@ -195,9 +216,13 @@ class App:
         card.grid_columnconfigure(1, weight=1)
 
         def label(parent, text, row):
-            ctk.CTkLabel(parent, text=text, font=ctk.CTkFont(size=13),
-                         text_color="#b0b0b0", anchor="w").grid(
-                row=row, column=0, sticky="w", padx=(16, 10), pady=11)
+            ctk.CTkLabel(
+                parent,
+                text=text,
+                font=ctk.CTkFont(size=13),
+                text_color="#b0b0b0",
+                anchor="w",
+            ).grid(row=row, column=0, sticky="w", padx=(16, 10), pady=11)
 
         # Dictation hotkey
         label(card, "Dictation", 0)
@@ -207,8 +232,9 @@ class App:
         self.hotkey_var = ctk.StringVar(value=self.settings["hotkey"])
         self.hotkey_entry = ctk.CTkEntry(hk_row, textvariable=self.hotkey_var)
         self.hotkey_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        self.set_btn = ctk.CTkButton(hk_row, text="Set", width=64,
-                                     command=self.capture_hotkey)
+        self.set_btn = ctk.CTkButton(
+            hk_row, text="Set", width=64, command=self.capture_hotkey
+        )
         self.set_btn.grid(row=0, column=1)
 
         # Command hotkey — enters command mode (routes speech to a pipeline)
@@ -219,40 +245,71 @@ class App:
         self.command_hotkey_var = ctk.StringVar(value=self.settings["command_hotkey"])
         self.command_entry = ctk.CTkEntry(cmd_row, textvariable=self.command_hotkey_var)
         self.command_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        self.cmd_set_btn = ctk.CTkButton(cmd_row, text="Set", width=64,
-                                         command=self.capture_command_hotkey)
+        self.cmd_set_btn = ctk.CTkButton(
+            cmd_row, text="Set", width=64, command=self.capture_command_hotkey
+        )
         self.cmd_set_btn.grid(row=0, column=1)
 
         # Model
         label(card, "Model", 2)
-        cur_model = next((k for k, v in MODELS.items() if v == self.settings["model"]),
-                         list(MODELS)[-1])
-        self.model_menu = ctk.CTkOptionMenu(card, values=list(MODELS),
-                                            command=lambda _v: self.reload_model())
+        cur_model = next(
+            (k for k, v in MODELS.items() if v == self.settings["model"]),
+            list(MODELS)[-1],
+        )
+        self.model_menu = ctk.CTkOptionMenu(
+            card, values=list(MODELS), command=lambda _v: self.reload_model()
+        )
         self.model_menu.set(cur_model)
         self.model_menu.grid(row=2, column=1, sticky="ew", padx=(0, 14), pady=8)
 
         # Typing mode
         label(card, "Typing", 3)
-        cur_out = next((k for k, v in OUTPUT_MODES.items()
-                        if v == self.settings.get("output_mode")), list(OUTPUT_MODES)[0])
-        self.output_seg = ctk.CTkSegmentedButton(card, values=list(OUTPUT_MODES),
-                                                 command=lambda _v: self.persist())
+        cur_out = next(
+            (
+                k
+                for k, v in OUTPUT_MODES.items()
+                if v == self.settings.get("output_mode")
+            ),
+            list(OUTPUT_MODES)[0],
+        )
+        self.output_seg = ctk.CTkSegmentedButton(
+            card, values=list(OUTPUT_MODES), command=lambda _v: self.persist()
+        )
         self.output_seg.set(cur_out)
         self.output_seg.grid(row=3, column=1, sticky="ew", padx=(0, 14), pady=8)
 
         # Language
         label(card, "Language", 4)
-        self.lang_menu = ctk.CTkOptionMenu(card, values=LANGS, width=120,
-                                           command=lambda _v: self.persist())
+        self.lang_menu = ctk.CTkOptionMenu(
+            card, values=LANGS, width=120, command=lambda _v: self.persist()
+        )
         self.lang_menu.set(self.settings.get("language") or "auto")
         self.lang_menu.grid(row=4, column=1, sticky="w", padx=(0, 14), pady=8)
 
+        # Webhook URL (command mode target)
+        label(card, "Webhook", 5)
+        webhook_row = ctk.CTkFrame(card, fg_color="transparent")
+        webhook_row.grid(row=5, column=1, sticky="ew", padx=(0, 14), pady=8)
+        webhook_row.grid_columnconfigure(0, weight=1)
+        self.webhook_var = ctk.StringVar(value=self.settings.get("webhook_url", ""))
+        ctk.CTkEntry(
+            webhook_row,
+            textvariable=self.webhook_var,
+            placeholder_text="http://localhost:5678/webhook-test/…",
+        ).grid(row=0, column=0, sticky="ew")
+        self.webhook_var.trace_add("write", lambda *_: self.persist())
+
         # --- Advanced (collapsible) ----------------------------------------
         self.adv_btn = ctk.CTkButton(
-            body, text="▸  Advanced", anchor="w", height=32,
-            fg_color="transparent", hover_color="#2b2b2b", text_color="#b0b0b0",
-            command=self._toggle_advanced)
+            body,
+            text="▸  Advanced",
+            anchor="w",
+            height=32,
+            fg_color="transparent",
+            hover_color="#2b2b2b",
+            text_color="#b0b0b0",
+            command=self._toggle_advanced,
+        )
         self.adv_btn.grid(row=2, column=0, sticky="ew", padx=IPADX, pady=(8, 0))
 
         self.adv = ctk.CTkFrame(body, corner_radius=12)
@@ -266,40 +323,85 @@ class App:
         self.rms_var = ctk.DoubleVar(value=float(self.settings["mic_rms"]))
 
         self.sil_value = self._adv_slider(
-            self.adv, 0, "Pause split", self.silence_var, 0.4, 2.0, 16,
-            lambda v: f"{v:.1f}s", "continuous: silence gap that ends a sentence")
+            self.adv,
+            0,
+            "Pause split",
+            self.silence_var,
+            0.4,
+            2.0,
+            16,
+            lambda v: f"{v:.1f}s",
+            "continuous: silence gap that ends a sentence",
+        )
         self.beam_value = self._adv_slider(
-            self.adv, 2, "Beam size", self.beam_var, 1, 5, 4,
-            lambda v: f"{int(v)}", "higher = more accurate but slower")
+            self.adv,
+            2,
+            "Beam size",
+            self.beam_var,
+            1,
+            5,
+            4,
+            lambda v: f"{int(v)}",
+            "higher = more accurate but slower",
+        )
         self.preroll_value = self._adv_slider(
-            self.adv, 4, "Pre-roll", self.preroll_var, 0.2, 1.5, 13,
-            lambda v: f"{v:.1f}s", "audio kept before keypress (first-word onset)")
+            self.adv,
+            4,
+            "Pre-roll",
+            self.preroll_var,
+            0.2,
+            1.5,
+            13,
+            lambda v: f"{v:.1f}s",
+            "audio kept before keypress (first-word onset)",
+        )
         self.rms_value = self._adv_slider(
-            self.adv, 6, "Mic gate", self.rms_var, 0.004, 0.030, 26,
-            lambda v: f"{v:.3f}", "continuous: louder gate = ignores quiet noise")
+            self.adv,
+            6,
+            "Mic gate",
+            self.rms_var,
+            0.004,
+            0.030,
+            26,
+            lambda v: f"{v:.3f}",
+            "continuous: louder gate = ignores quiet noise",
+        )
 
         # --- Footer ---------------------------------------------------------
         ctk.CTkLabel(
-            body, text="Keep this window open (minimize it). Hotkey works globally.",
-            text_color="#5f5f5f", font=ctk.CTkFont(size=11)).grid(
-            row=4, column=0, pady=(8, 12))
+            body,
+            text="Keep this window open (minimize it). Hotkey works globally.",
+            text_color="#5f5f5f",
+            font=ctk.CTkFont(size=11),
+        ).grid(row=4, column=0, pady=(8, 12))
 
     def _adv_slider(self, parent, row, name, var, lo, hi, steps, fmt, hint):
-        ctk.CTkLabel(parent, text=name, font=ctk.CTkFont(size=13),
-                     text_color="#b0b0b0", anchor="w").grid(
-            row=row, column=0, sticky="w", padx=(16, 10), pady=(12, 0))
+        ctk.CTkLabel(
+            parent,
+            text=name,
+            font=ctk.CTkFont(size=13),
+            text_color="#b0b0b0",
+            anchor="w",
+        ).grid(row=row, column=0, sticky="w", padx=(16, 10), pady=(12, 0))
         sl_row = ctk.CTkFrame(parent, fg_color="transparent")
         sl_row.grid(row=row, column=1, sticky="ew", padx=(0, 14), pady=(12, 0))
         sl_row.grid_columnconfigure(0, weight=1)
-        val_lbl = ctk.CTkLabel(sl_row, text=fmt(var.get()), width=46,
-                               font=ctk.CTkFont(size=13))
+        val_lbl = ctk.CTkLabel(
+            sl_row, text=fmt(var.get()), width=46, font=ctk.CTkFont(size=13)
+        )
         val_lbl.grid(row=0, column=1)
-        sl = ctk.CTkSlider(sl_row, from_=lo, to=hi, number_of_steps=steps, variable=var,
-                           command=lambda _v, l=val_lbl, f=fmt, vv=var: self._on_adv_change(l, f, vv))
+        sl = ctk.CTkSlider(
+            sl_row,
+            from_=lo,
+            to=hi,
+            number_of_steps=steps,
+            variable=var,
+            command=lambda _v, l=val_lbl, f=fmt, vv=var: self._on_adv_change(l, f, vv),
+        )
         sl.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-        ctk.CTkLabel(parent, text=hint, text_color="#666", font=ctk.CTkFont(size=11),
-                     anchor="w").grid(row=row + 1, column=0, columnspan=2,
-                                      sticky="w", padx=16, pady=(0, 2))
+        ctk.CTkLabel(
+            parent, text=hint, text_color="#666", font=ctk.CTkFont(size=11), anchor="w"
+        ).grid(row=row + 1, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 2))
         return val_lbl
 
     def _toggle_advanced(self) -> None:
@@ -330,9 +432,13 @@ class App:
             pass
         win.grid_columnconfigure(0, weight=1)
         win.grid_rowconfigure(0, weight=1)
-        box = ctk.CTkTextbox(win, font=ctk.CTkFont(family="Consolas", size=12), wrap="word")
+        box = ctk.CTkTextbox(
+            win, font=ctk.CTkFont(family="Consolas", size=12), wrap="word"
+        )
         box.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-        box.insert("end", "\n".join(self._log_lines) + ("\n" if self._log_lines else ""))
+        box.insert(
+            "end", "\n".join(self._log_lines) + ("\n" if self._log_lines else "")
+        )
         box.see("end")
         box.configure(state="disabled")
         self._log_win, self._log_box = win, box
@@ -340,28 +446,6 @@ class App:
         def _closed():
             self._log_win = None
             self._log_box = None
-            win.destroy()
-
-        win.protocol("WM_DELETE_WINDOW", _closed)
-
-    def open_pipeline_editor(self) -> None:
-        if getattr(self, "_editor_win", None) is not None and self._editor_win.winfo_exists():
-            self._editor_win.focus()
-            return
-        from automation.editor import PipelineEditor
-
-        win = ctk.CTkToplevel(self.root)
-        win.title("incant — Pipeline Editor")
-        win.geometry("1100x680")
-        try:
-            win.after(250, lambda: win.iconbitmap(str(ICON_ICO)))
-        except Exception:  # noqa: BLE001
-            pass
-        PipelineEditor(win).pack(fill="both", expand=True)
-        self._editor_win = win
-
-        def _closed():
-            self._editor_win = None
             win.destroy()
 
         win.protocol("WM_DELETE_WINDOW", _closed)
@@ -384,19 +468,75 @@ class App:
                     self.set_btn.configure(state="normal", text="Set")
                 elif kind == "enable_cmd_set":
                     self.cmd_set_btn.configure(state="normal", text="Set")
-                elif kind == "guard":
-                    self._open_guard_popup(val)
                 elif kind == "log":
                     self._log_lines.append(val)
                     del self._log_lines[:-500]  # cap history
-                    if self._log_box is not None and self._log_win and self._log_win.winfo_exists():
+                    if (
+                        self._log_box is not None
+                        and self._log_win
+                        and self._log_win.winfo_exists()
+                    ):
                         self._log_box.configure(state="normal")
                         self._log_box.insert("end", val + "\n")
                         self._log_box.see("end")
                         self._log_box.configure(state="disabled")
         except queue.Empty:
             pass
+        self._drain_approvals()
         self.root.after(80, self._drain_queue)
+
+    def _drain_approvals(self) -> None:
+        """Check for pending approval requests from n8n and show a dialog."""
+        req = pop_approval()
+        while req is not None:
+            self._show_approval_dialog(req)
+            req = pop_approval()
+
+    def _show_approval_dialog(self, req: ApprovalRequest) -> None:
+        """Modal popup: show the action details and let the user Approve / Reject."""
+        win = ctk.CTkToplevel(self.root)
+        win.title(req.title)
+        win.geometry("480x360")
+        win.minsize(420, 300)
+        win.transient(self.root)
+        win.grab_set()
+        win.focus()
+
+        ctk.CTkLabel(
+            win, text=req.title, font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(fill="x", padx=20, pady=(16, 4))
+
+        textbox = ctk.CTkTextbox(win, wrap="word", font=ctk.CTkFont(size=13))
+        textbox.pack(fill="both", expand=True, padx=20, pady=8)
+        textbox.insert("1.0", req.message)
+        textbox.configure(state="disabled")
+
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(0, 16))
+
+        ctk.CTkButton(
+            btn_row,
+            text="Reject",
+            fg_color="#a33",
+            hover_color="#822",
+            command=lambda: self._resolve_approval(win, req.id, False),
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            btn_row,
+            text="Approve",
+            fg_color="#2a7",
+            hover_color="#195",
+            command=lambda: self._resolve_approval(win, req.id, True),
+        ).pack(side="right")
+
+    def _resolve_approval(
+        self, win: ctk.CTkToplevel, approval_id: str, approved: bool
+    ) -> None:
+        win.destroy()
+        label = "approved" if approved else "rejected"
+        self.log_line(f"[approval] {approval_id[:8]}… {label}")
+        respond_approval(approval_id, approved)
 
     def persist(self) -> None:
         lang = self.lang_menu.get()
@@ -410,6 +550,7 @@ class App:
             beam_size=int(self.beam_var.get()),
             preroll_s=round(float(self.preroll_var.get()), 1),
             mic_rms=round(float(self.rms_var.get()), 3),
+            webhook_url=self.webhook_var.get().strip(),
         )
         save_settings(self.settings)
 
@@ -449,7 +590,8 @@ class App:
                 pass
         try:
             self.command_hotkey_handle = keyboard.add_hotkey(
-                hk, self.toggle_command, suppress=False)
+                hk, self.toggle_command, suppress=False
+            )
             self.log_line(f"[hotkey] command bound to {hk}")
         except Exception as e:  # noqa: BLE001
             self.log_line(f"[hotkey] invalid command '{hk}': {e}")
@@ -517,14 +659,17 @@ class App:
             audio = self.engine.end_capture()
             self.busy.set()
             self.set_status("transcribing…")
-            threading.Thread(target=self._do_transcribe, args=(audio,), daemon=True).start()
+            threading.Thread(
+                target=self._do_transcribe, args=(audio,), daemon=True
+            ).start()
 
     def _do_transcribe(self, audio: np.ndarray) -> None:
         try:
             lang = self.settings.get("language") or None
             with self.model_lock:
-                text, detected = stt.transcribe_audio(self.model, audio, lang,
-                                                      beam_size=self._beam())
+                text, detected = stt.transcribe_audio(
+                    self.model, audio, lang, beam_size=self._beam()
+                )
             if text:
                 self.log_line(f"[{detected}] {text}")
                 keyboard.write(text + " ", delay=0)
@@ -540,7 +685,8 @@ class App:
             gap = float(self.settings.get("silence_s", 1.0))
             rms = float(self.settings.get("mic_rms", 0.012))
             self.segmenter = stt.PhraseSegmenter(
-                on_phrase=self.phrase_queue.put, min_silence_s=gap, silence_rms=rms)
+                on_phrase=self.phrase_queue.put, min_silence_s=gap, silence_rms=rms
+            )
             self.stitcher = stt.TextStitcher()
             pre = self.engine.preroll_audio()
             if pre.size:
@@ -569,8 +715,13 @@ class App:
                 lang = self.settings.get("language") or None
                 prompt = self.stitcher.prompt if self.stitcher else None
                 with self.model_lock:
-                    text, _ = stt.transcribe_audio(self.model, audio, lang,
-                                                   initial_prompt=prompt, beam_size=self._beam())
+                    text, _ = stt.transcribe_audio(
+                        self.model,
+                        audio,
+                        lang,
+                        initial_prompt=prompt,
+                        beam_size=self._beam(),
+                    )
                 out = self.stitcher.next(text) if self.stitcher else text
                 if out:
                     self.log_line(f"› {text}")
@@ -581,11 +732,17 @@ class App:
     # word by word ----------------------------------------------------------
     def _toggle_word(self) -> None:
         if self.word_streamer is None:
+
             def tx(audio, prompt):
                 lang = self.settings.get("language") or None
                 with self.model_lock:
-                    return stt.transcribe_words(self.model, audio, lang,
-                                                initial_prompt=prompt, beam_size=self._beam())
+                    return stt.transcribe_words(
+                        self.model,
+                        audio,
+                        lang,
+                        initial_prompt=prompt,
+                        beam_size=self._beam(),
+                    )
 
             def out(text):
                 keyboard.write(text, delay=0)
@@ -613,8 +770,12 @@ class App:
             self.log_line("[cmd] model not ready yet")
             return
         if not self.command_on:
-            if (self.engine.capturing or self.busy.is_set()
-                    or self.continuous_on or self.word_streamer is not None):
+            if (
+                self.engine.capturing
+                or self.busy.is_set()
+                or self.continuous_on
+                or self.word_streamer is not None
+            ):
                 self.log_line("[cmd] busy — finish dictation first")
                 return
             self.engine.begin_capture()
@@ -624,93 +785,53 @@ class App:
             audio = self.engine.end_capture()
             self.command_on = False
             self.set_status("routing…")
-            threading.Thread(target=self._run_command, args=(audio,), daemon=True).start()
+            threading.Thread(
+                target=self._run_command, args=(audio,), daemon=True
+            ).start()
 
     def _run_command(self, audio: np.ndarray) -> None:
         try:
             lang = self.settings.get("language") or None
             with self.model_lock:
-                text, _ = stt.transcribe_audio(self.model, audio, lang, beam_size=self._beam())
+                text, _ = stt.transcribe_audio(
+                    self.model, audio, lang, beam_size=self._beam()
+                )
             if not text:
                 self.log_line("[cmd] (nothing heard)")
                 return
             self.log_line(f"[cmd] heard: {text}")
-            pipes = discover_pipelines(PIPELINES_DIR)
-            routed = router.route(text, pipes)
-            if not routed.matched:
-                self.log_line(f"[cmd] no pipeline matched ({routed.reason}) — cleaning + typing")
+            webhook_url = self.settings.get("webhook_url", "").strip()
+            if not webhook_url:
+                self.log_line("[cmd] no webhook configured — cleaning + typing")
                 self._clean_and_type(text)
                 return
-            self.log_line(f"[cmd] → {routed.pipeline.name}")
-            self.set_status(f"running {routed.pipeline.name}…")
-            ctx = ActionContext(
-                log=self.log_line,
-                type_text=lambda t: keyboard.write(t, delay=0),
-            )
-            result = Engine(ctx=ctx, guard=self._guard_handler).run(routed.pipeline, text)
-            self.log_line("[cmd] " + result.summary())
+            outcome = run_command(text, webhook_url=webhook_url)
+            if outcome.error:
+                self.log_line(f"[cmd] error: {outcome.error}")
+            else:
+                self.log_line(f"[cmd] sent OK  reply: {outcome.reply or '(none)'}")
         except Exception as e:  # noqa: BLE001
             self.log_line(f"[cmd] error: {e}")
         finally:
             self.set_status("ready — press your hotkey to talk")
 
     def _clean_and_type(self, text: str) -> None:
-        """No-route fallback: AI-clean the transcript and type it — never raw."""
+        """No-webhook fallback: AI-clean the transcript and type it — never raw."""
         try:
-            model = make_model(router.DEFAULT_ROUTER_MODEL)
+            model = make_model(
+                self.settings.get(
+                    "router_model", {"backend": "ollama", "model": "llama3.2"}
+                )
+            )
             cleaned = model.complete(
                 "Fix the grammar, capitalization and punctuation of this dictation. "
-                "Return ONLY the corrected text, nothing else.", text).strip()
+                "Return ONLY the corrected text, nothing else.",
+                text,
+            ).strip()
             keyboard.write((cleaned or text) + " ", delay=0)
         except ModelError as e:
             self.log_line(f"[cmd] AI clean unavailable ({e}); typing raw")
             keyboard.write(text + " ", delay=0)
-
-    def _guard_handler(self, req) -> GuardDecision:
-        """Called on the engine thread; blocks until the UI popup answers."""
-        self._guard_decision = GuardDecision("approve")
-        self.guard_event.clear()
-        self.ui_queue.put(("guard", req))
-        self.guard_event.wait()
-        return self._guard_decision
-
-    def _open_guard_popup(self, req) -> None:
-        win = ctk.CTkToplevel(self.root)
-        win.title("incant — guard")
-        win.geometry("460x440")
-        win.attributes("-topmost", True)
-        win.grid_columnconfigure(0, weight=1)
-        win.grid_rowconfigure(1, weight=1)
-
-        ctk.CTkLabel(
-            win, text=f"Guard: {req.node.id} ({req.node.type})   →   next: {req.next_step}",
-            font=ctk.CTkFont(size=13, weight="bold"), anchor="w").grid(
-            row=0, column=0, sticky="ew", padx=14, pady=(12, 4))
-        box = ctk.CTkTextbox(win, wrap="word", font=ctk.CTkFont(family="Consolas", size=12))
-        box.grid(row=1, column=0, sticky="nsew", padx=14, pady=4)
-        box.insert("end", render_payload(req.inbound))
-        box.configure(state="disabled")
-        fb = ctk.CTkEntry(win, placeholder_text="refactor feedback (optional)")
-        fb.grid(row=2, column=0, sticky="ew", padx=14, pady=6)
-
-        btns = ctk.CTkFrame(win, fg_color="transparent")
-        btns.grid(row=3, column=0, sticky="ew", padx=14, pady=(4, 12))
-
-        def decide(action: str) -> None:
-            if action == "refactor":
-                self._guard_decision = GuardDecision("refactor", fb.get().strip())
-            else:
-                self._guard_decision = GuardDecision(action)
-            self.guard_event.set()
-            win.destroy()
-
-        ctk.CTkButton(btns, text="Approve", fg_color="#2ecc71", hover_color="#27ae60",
-                      command=lambda: decide("approve")).pack(side="left", padx=4)
-        ctk.CTkButton(btns, text="Refactor",
-                      command=lambda: decide("refactor")).pack(side="left", padx=4)
-        ctk.CTkButton(btns, text="Stop", fg_color="#e74c3c", hover_color="#c0392b",
-                      command=lambda: decide("stop")).pack(side="left", padx=4)
-        win.protocol("WM_DELETE_WINDOW", lambda: decide("stop"))  # closing = safe stop
 
     # ------------------------------------------------------------- lifecycle
     def on_close(self) -> None:
@@ -722,6 +843,7 @@ class App:
                 self.word_streamer.stop()
             self.engine.stop_stream()
             keyboard.unhook_all_hotkeys()
+            stop_notifier()
         except Exception:  # noqa: BLE001
             pass
         self.root.destroy()

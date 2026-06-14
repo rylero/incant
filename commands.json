@@ -1,0 +1,10 @@
+{
+  "commands": [
+    {
+      "name": "Send Email",
+      "when_to_use": "compose and send an email to someone, e.g. 'email Sarah that I'm running late' or 'send mom a note about dinner'",
+      "webhook": "http://localhost:5678/webhook/d0813e4d-57d2-45f0-8edb-abbab7ea4c9b",
+      "auth": "n8n"
+    }
+  ]
+}

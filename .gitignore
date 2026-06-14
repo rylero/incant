@@ -17,6 +17,9 @@ settings.json
 # n8n local stack secrets (encryption key + timezone)
 n8n/.env
 
+# n8n backups: decrypted credentials + full data volume dump — never commit
+n8n/backups/
+
 # Whisper model cache (downloaded weights, multi-GB)
 *.bin
 models/
