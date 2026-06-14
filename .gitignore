@@ -11,6 +11,9 @@ venv/
 # App
 settings.json
 
+# Command-mode routing config: local n8n webhook IDs, per-machine
+commands.json
+
 # Automation: named Credentials store (SMTP logins, etc.) — never commit
 .credentials.json
 
@@ -23,6 +26,12 @@ n8n/backups/
 # Whisper model cache (downloaded weights, multi-GB)
 *.bin
 models/
+
+# PyInstaller / Inno Setup build output
+build/
+dist/
+dist_installer/
+*.spec
 
 # OS / editor
 .DS_Store

@@ -19,11 +19,27 @@ import os
 from pathlib import Path
 
 STORE_ENV = "INCANT_CREDENTIALS"
-DEFAULT_STORE = Path(__file__).resolve().parent.parent / ".credentials.json"
+# %APPDATA% so the store is writable even when the app is installed under
+# Program Files (a non-admin user can't write next to this file there).
+DEFAULT_STORE = Path(os.environ.get("APPDATA", Path.home())) / "incant" / "credentials.json"
 
 
 class CredentialError(RuntimeError):
     pass
+
+
+def save(name: str, fields: dict[str, str]) -> None:
+    """Set credential ``name`` to ``fields`` in the credential store file."""
+    store_path = Path(os.environ.get(STORE_ENV, DEFAULT_STORE))
+    store: dict = {}
+    if store_path.exists():
+        try:
+            store = json.loads(store_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            store = {}
+    store[name] = fields
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_path.write_text(json.dumps(store, indent=2), encoding="utf-8")
 
 
 def resolve(name: str) -> dict[str, str]:

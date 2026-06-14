@@ -13,6 +13,7 @@ from __future__ import annotations
 import ctypes
 import json
 import math
+import os
 import queue
 import random
 import threading
@@ -28,6 +29,7 @@ import stt  # sets up CUDA DLLs on import
 
 # Automation layer (command mode): route a transcript to a registered n8n
 # workflow and fire its webhook. See automation/ and docs/adr/.
+from automation import credentials
 from automation.command import run_command
 from automation.models import make_model, ModelError
 from automation.notifier import (
@@ -38,7 +40,9 @@ from automation.notifier import (
     respond_approval,
 )
 
-SETTINGS_PATH = Path(__file__).with_name("settings.json")
+# Settings live in %APPDATA% so they're writable even when the app is
+# installed under Program Files (a non-admin user can't write next to __file__).
+SETTINGS_PATH = Path(os.environ.get("APPDATA", Path.home())) / "incant" / "settings.json"
 ASSETS = Path(__file__).with_name("assets")
 ICON_PNG = ASSETS / "incant.png"
 ICON_ICO = ASSETS / "incant.ico"
@@ -151,6 +155,7 @@ def load_settings() -> dict:
 
 def save_settings(s: dict) -> None:
     try:
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
         SETTINGS_PATH.write_text(json.dumps(s, indent=2))
     except Exception:  # noqa: BLE001
         pass
@@ -430,6 +435,37 @@ class App:
             "continuous: louder gate = ignores quiet noise",
         )
 
+        # n8n JWT secret — passphrase for command-mode webhook auth (ADR-0004)
+        ctk.CTkLabel(
+            self.adv,
+            text="n8n secret",
+            font=ctk.CTkFont(size=13),
+            text_color="#b0b0b0",
+            anchor="w",
+        ).grid(row=8, column=0, sticky="w", padx=(16, 10), pady=(12, 0))
+        n8n_row = ctk.CTkFrame(self.adv, fg_color="transparent")
+        n8n_row.grid(row=8, column=1, sticky="ew", padx=(0, 14), pady=(12, 0))
+        n8n_row.grid_columnconfigure(0, weight=1)
+        try:
+            n8n_secret = credentials.resolve("n8n").get("secret", "")
+        except credentials.CredentialError:
+            n8n_secret = ""
+        self.n8n_secret_var = ctk.StringVar(value=n8n_secret)
+        self.n8n_secret_entry = ctk.CTkEntry(
+            n8n_row, textvariable=self.n8n_secret_var, show="*"
+        )
+        self.n8n_secret_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ctk.CTkButton(
+            n8n_row, text="Save", width=64, command=self.save_n8n_secret
+        ).grid(row=0, column=1)
+        ctk.CTkLabel(
+            self.adv,
+            text="command mode: JWT passphrase for the n8n webhook (ADR-0004)",
+            text_color="#666",
+            font=ctk.CTkFont(size=11),
+            anchor="w",
+        ).grid(row=9, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 2))
+
         # --- Footer ---------------------------------------------------------
         ctk.CTkLabel(
             body,
@@ -652,7 +688,13 @@ class App:
         self._overlay_bars = bars
         # Per-bar amplitude weights so all bars pulse with the same audio
         # level but at different relative heights (static EQ look, no scroll).
-        self._overlay_weights = [random.uniform(0.5, 1.4) for _ in range(OVERLAY_BARS)]
+        # Tapered by a dome shape so bars near the ends sit lower than the
+        # middle ones.
+        self._overlay_weights = [
+            random.uniform(0.5, 1.4)
+            * (0.5 + 0.5 * math.sin(math.pi * i / (OVERLAY_BARS - 1)))
+            for i in range(OVERLAY_BARS)
+        ]
         self._overlay_visible = False
         self._make_clickthrough(win)
 
@@ -717,6 +759,11 @@ class App:
             webhook_url=self.webhook_var.get().strip(),
         )
         save_settings(self.settings)
+
+    def save_n8n_secret(self) -> None:
+        secret = self.n8n_secret_var.get().strip()
+        credentials.save("n8n", {"secret": secret})
+        self.log_line("[settings] n8n secret saved")
 
     # ---------------------------------------------------------------- hotkey
     def bind_hotkey(self, hk: str) -> None:
@@ -784,6 +831,14 @@ class App:
         def work() -> None:
             with self.model_lock:
                 try:
+                    from faster_whisper.utils import download_model
+
+                    try:
+                        download_model(size, local_files_only=True)
+                    except Exception:  # noqa: BLE001
+                        self.set_status(f"downloading {size} model (first run, several GB)…")
+                        self.log_line(f"[load] {size} not cached — downloading from Hugging Face…")
+
                     m = stt.load_model(size)
                     list(m.transcribe(np.zeros(stt.SAMPLE_RATE, dtype=np.float32))[0])
                     self.model = m

@@ -2,10 +2,20 @@
 
 A little app I am playing around with that combines voice dicatation and automation using pipleines.
 
-## Run
+## Download & Run (no Python needed)
+
+Grab `incant-setup.exe` and run it. During install you can check **GPU
+acceleration (NVIDIA CUDA)** if the machine has an NVIDIA GPU — leave it
+unchecked for a CPU-only install (smaller download; the app falls back to
+CPU automatically either way).
+
+To build the installer yourself: see `installer.iss` for the PyInstaller +
+Inno Setup commands.
+
+## Run from source
 ```powershell
 uv sync
-uv run ui.py
+uv run ui
 ```
 
 ## Config (env vars)
