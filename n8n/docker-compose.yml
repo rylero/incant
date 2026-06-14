@@ -1,0 +1,43 @@
+# Local n8n for incant's automation backend (ADR-0004 pivot).
+#
+# incant stays the voice front-end (dictation, command mode, Routing Pass) and
+# triggers n8n workflows over HTTP webhooks; n8n owns the integrations,
+# credentials, and execution. Everything runs on localhost — nothing leaves the
+# machine unless a workflow you build reaches out.
+#
+#   cd n8n && cp .env.example .env   # then edit, or use the generated .env
+#   docker compose up -d
+#   open http://localhost:5678        # first run: create the owner account
+#
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: incant-n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      # --- addressing: incant calls webhooks at http://localhost:5678/... ---
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - N8N_LISTEN_ADDRESS=0.0.0.0
+      - WEBHOOK_URL=http://localhost:5678/
+      # http on localhost: don't require a secure cookie or the login breaks
+      - N8N_SECURE_COOKIE=false
+      # current n8n wants task runners on (silences the deprecation warning)
+      - N8N_RUNNERS_ENABLED=true
+      # official quickstart default: lock down the settings file perms
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+      # stable key so stored credentials survive a container/volume rebuild
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE:-America/New_York}
+      - TZ=${GENERIC_TIMEZONE:-America/New_York}
+      # local-first hygiene: no telemetry, no personalization survey
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - N8N_PERSONALIZATION_ENABLED=false
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+volumes:
+  n8n_data:
