@@ -26,6 +26,7 @@ import customtkinter as ctk
 from PIL import Image
 
 import stt  # sets up CUDA DLLs on import
+import corrections
 
 # Automation layer (command mode): route a transcript to a registered n8n
 # workflow and fire its webhook. See automation/ and docs/adr/.
@@ -69,6 +70,7 @@ DEFAULTS = {
     "preroll_s": 0.5,  # audio kept before keypress (first-word onset)
     "mic_rms": 0.004,  # continuous silence gate (mic sensitivity)
     "webhook_url": "",  # n8n webhook for command mode (empty = AI-clean + type)
+    "review_hotkey": "ctrl+alt+r",  # pops overlay to correct the last transcript
 }
 
 STATUS_COLORS = {
@@ -195,6 +197,11 @@ class App:
         self._log_win: ctk.CTkToplevel | None = None
         self._log_box: ctk.CTkTextbox | None = None
         self.adv_open = False
+        # corrections
+        self._corrections: dict[str, str] = corrections.load_map()
+        self._last_typed: str = ""
+        self._review_hotkey_handle = None
+        self._review_win: ctk.CTkToplevel | None = None
 
         root.title("incant")
         root.geometry("540x620")
@@ -209,6 +216,9 @@ class App:
         self._build_overlay()
         self.bind_hotkey(self.settings["hotkey"])
         self.bind_command_hotkey(self.settings["command_hotkey"])
+        self.bind_review_hotkey(self.settings.get("review_hotkey", DEFAULTS["review_hotkey"]))
+        if self._corrections:
+            self.log_line(f"[correct] {len(self._corrections)} correction(s) loaded")
         try:
             self.engine.start_stream()
         except Exception as e:  # noqa: BLE001
@@ -366,6 +376,21 @@ class App:
             placeholder_text="http://localhost:5678/webhook-test/…",
         ).grid(row=0, column=0, sticky="ew")
         self.webhook_var.trace_add("write", lambda *_: self.persist())
+
+        # Review hotkey — pops overlay to correct the last transcript
+        label(card, "Review", 6)
+        rev_row = ctk.CTkFrame(card, fg_color="transparent")
+        rev_row.grid(row=6, column=1, sticky="ew", padx=(0, 14), pady=8)
+        rev_row.grid_columnconfigure(0, weight=1)
+        self.review_hotkey_var = ctk.StringVar(
+            value=self.settings.get("review_hotkey", DEFAULTS["review_hotkey"])
+        )
+        self.review_entry = ctk.CTkEntry(rev_row, textvariable=self.review_hotkey_var)
+        self.review_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.rev_set_btn = ctk.CTkButton(
+            rev_row, text="Set", width=64, command=self.capture_review_hotkey
+        )
+        self.rev_set_btn.grid(row=0, column=1)
 
         # --- Advanced (collapsible) ----------------------------------------
         self.adv_btn = ctk.CTkButton(
@@ -567,6 +592,10 @@ class App:
                     self.set_btn.configure(state="normal", text="Set")
                 elif kind == "enable_cmd_set":
                     self.cmd_set_btn.configure(state="normal", text="Set")
+                elif kind == "enable_rev_set":
+                    self.rev_set_btn.configure(state="normal", text="Set")
+                elif kind == "review":
+                    self._show_review_overlay()
                 elif kind == "log":
                     self._log_lines.append(val)
                     del self._log_lines[:-500]  # cap history
@@ -749,6 +778,7 @@ class App:
         self.settings.update(
             hotkey=self.hotkey_var.get().strip(),
             command_hotkey=self.command_hotkey_var.get().strip(),
+            review_hotkey=self.review_hotkey_var.get().strip(),
             model=MODELS[self.model_menu.get()],
             language="" if lang == "auto" else lang,
             output_mode=OUTPUT_MODES[self.output_seg.get()],
@@ -821,6 +851,123 @@ class App:
 
         threading.Thread(target=grab, daemon=True).start()
 
+    # ---------------------------------------------------------- review hotkey
+    def bind_review_hotkey(self, hk: str) -> None:
+        if self._review_hotkey_handle is not None:
+            try:
+                keyboard.remove_hotkey(self._review_hotkey_handle)
+            except (KeyError, ValueError):
+                pass
+        try:
+            self._review_hotkey_handle = keyboard.add_hotkey(
+                hk, lambda: self.ui_queue.put(("review", None)), suppress=False
+            )
+            self.log_line(f"[hotkey] review bound to {hk}")
+        except Exception as e:  # noqa: BLE001
+            self.log_line(f"[hotkey] invalid review '{hk}': {e}")
+
+    def capture_review_hotkey(self) -> None:
+        self.rev_set_btn.configure(state="disabled", text="press…")
+        self.set_status("press your review hotkey combo…")
+
+        def grab() -> None:
+            hk = keyboard.read_hotkey(suppress=False)
+            self.review_hotkey_var.set(hk)
+            self.bind_review_hotkey(hk)
+            self.persist()
+            self.set_status("ready — press your hotkey to talk")
+            self.ui_queue.put(("enable_rev_set", None))
+
+        threading.Thread(target=grab, daemon=True).start()
+
+    def _show_review_overlay(self) -> None:
+        if not self._last_typed:
+            self.log_line("[correct] nothing to review yet")
+            return
+        if self._review_win is not None and self._review_win.winfo_exists():
+            self._review_win.focus()
+            return
+
+        original = self._last_typed          # includes trailing space
+        display = original.rstrip()           # shown/edited without it
+
+        try:
+            prev_hwnd = ctypes.windll.user32.GetForegroundWindow()
+        except Exception:
+            prev_hwnd = None
+
+        win = ctk.CTkToplevel(self.root, fg_color=BG)
+        win.title("incant — correct")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        self._review_win = win
+
+        try:
+            left, top, right, bottom = _monitor_work_area(self.root.winfo_id())
+        except Exception:
+            left, top, right, bottom = 0, 0, win.winfo_screenwidth(), win.winfo_screenheight()
+        w, h = 520, 110
+        x = left + (right - left - w) // 2
+        y = bottom - h - 90
+        win.geometry(f"{w}x{h}+{x}+{y}")
+
+        ctk.CTkLabel(
+            win, text="Correct last transcript  (Enter = commit · Esc = cancel · 8s auto-dismiss)",
+            text_color="#7a7a7a", font=ctk.CTkFont(size=11), anchor="w",
+        ).pack(anchor="w", padx=16, pady=(10, 2))
+
+        var = ctk.StringVar(value=display)
+        entry = ctk.CTkEntry(win, textvariable=var, font=ctk.CTkFont(size=14))
+        entry.pack(fill="x", padx=16, pady=(0, 12))
+        entry.select_range(0, "end")
+        entry.focus_set()
+
+        dismissed = [False]
+
+        def _commit(event=None):
+            if dismissed[0]:
+                return
+            dismissed[0] = True
+            corrected = var.get().strip()
+            win.destroy()
+            self._review_win = None
+            if corrected == display or not corrected:
+                return
+
+            n_back = len(original)
+
+            def _retype():
+                try:
+                    if prev_hwnd:
+                        ctypes.windll.user32.SetForegroundWindow(prev_hwnd)
+                except Exception:
+                    pass
+                for _ in range(n_back):
+                    keyboard.press_and_release("backspace")
+                keyboard.write(corrected + " ", delay=0)
+                new_map = corrections.record(display, corrected)
+                self._corrections = new_map
+                self._last_typed = corrected + " "
+                self.log_line(f"[correct] '{display}' → '{corrected}'")
+
+            self.root.after(150, _retype)
+
+        def _cancel(event=None):
+            if dismissed[0]:
+                return
+            dismissed[0] = True
+            win.destroy()
+            self._review_win = None
+
+        def _auto_cancel():
+            if not dismissed[0] and win.winfo_exists():
+                _cancel()
+
+        entry.bind("<Return>", _commit)
+        entry.bind("<Escape>", _cancel)
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+        win.after(8000, _auto_cancel)
+
     # ----------------------------------------------------------------- model
     def reload_model(self) -> None:
         size = MODELS[self.model_menu.get()]
@@ -887,11 +1034,15 @@ class App:
             lang = self.settings.get("language") or None
             with self.model_lock:
                 text, detected = stt.transcribe_audio(
-                    self.model, audio, lang, beam_size=self._beam()
+                    self.model, audio, lang, beam_size=self._beam(),
+                    hotwords=corrections.hotwords(self._corrections),
                 )
+            text = corrections.apply(text, self._corrections)
             if text:
+                typed = text + " "
                 self.log_line(f"[{detected}] {text}")
-                keyboard.write(text + " ", delay=0)
+                self._last_typed = typed
+                keyboard.write(typed, delay=0)
             else:
                 self.log_line("[stt] (nothing heard)")
             self.set_status("ready — press your hotkey to talk")
@@ -940,10 +1091,13 @@ class App:
                         lang,
                         initial_prompt=prompt,
                         beam_size=self._beam(),
+                        hotwords=corrections.hotwords(self._corrections),
                     )
+                text = corrections.apply(text, self._corrections)
                 out = self.stitcher.next(text) if self.stitcher else text
                 if out:
                     self.log_line(f"› {text}")
+                    self._last_typed = out
                     keyboard.write(out, delay=0)
             except Exception as e:  # noqa: BLE001
                 self.log_line(f"[stt] phrase error: {e}")
@@ -951,6 +1105,7 @@ class App:
     # word by word ----------------------------------------------------------
     def _toggle_word(self) -> None:
         if self.word_streamer is None:
+            self._last_typed = ""
 
             def tx(audio, prompt):
                 lang = self.settings.get("language") or None
@@ -961,11 +1116,14 @@ class App:
                         lang,
                         initial_prompt=prompt,
                         beam_size=self._beam(),
+                        hotwords=corrections.hotwords(self._corrections),
                     )
 
             def out(text):
-                keyboard.write(text, delay=0)
-                self.log_line(f"› {text.strip()}")
+                corrected = corrections.apply(text, self._corrections)
+                keyboard.write(corrected, delay=0)
+                self._last_typed += corrected
+                self.log_line(f"› {corrected.strip()}")
 
             self.word_streamer = stt.WordStreamer(tx, out)
             pre = self.engine.preroll_audio()
@@ -1013,7 +1171,8 @@ class App:
             lang = self.settings.get("language") or None
             with self.model_lock:
                 text, _ = stt.transcribe_audio(
-                    self.model, audio, lang, beam_size=self._beam()
+                    self.model, audio, lang, beam_size=self._beam(),
+                    hotwords=corrections.hotwords(self._corrections),
                 )
             if not text:
                 self.log_line("[cmd] (nothing heard)")

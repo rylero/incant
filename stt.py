@@ -215,6 +215,7 @@ def transcribe_audio(
     language: str | None,
     initial_prompt: str | None = None,
     beam_size: int = 5,
+    hotwords: str | None = None,
 ):
     """Run Whisper on a mono 16k float32 array. Returns (clean_text, language)."""
     if audio.size < SAMPLE_RATE * 0.3:  # <0.3s -> nothing useful
@@ -229,6 +230,7 @@ def transcribe_audio(
         language=language,
         beam_size=beam_size,
         initial_prompt=initial_prompt,
+        hotwords=hotwords,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=300, speech_pad_ms=600),
     )
@@ -242,6 +244,7 @@ def transcribe_words(
     language: str | None,
     initial_prompt: str | None = None,
     beam_size: int = 5,
+    hotwords: str | None = None,
 ) -> list[dict]:
     """Transcribe with word timestamps. Returns [{word, start, end}, ...]."""
     if audio.size < SAMPLE_RATE * 0.3:
@@ -251,6 +254,7 @@ def transcribe_words(
         language=language,
         beam_size=beam_size,
         initial_prompt=initial_prompt,
+        hotwords=hotwords,
         word_timestamps=True,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=300, speech_pad_ms=600),
