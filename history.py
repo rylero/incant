@@ -69,6 +69,39 @@ def sessions(entries: list[dict]) -> list[dict]:
     return sorted(result, key=lambda x: x["ts"], reverse=True)
 
 
+def patch_last(session: str, raw: str, corrected_output: str) -> bool:
+    """Update the output field of the most recent entry matching session+raw.
+
+    Returns True if an entry was found and patched, False otherwise.
+    Rewrites the whole file — only called on explicit user correction, so fine.
+    """
+    if not _LOG_PATH.exists():
+        return False
+    entries = []
+    with _LOG_PATH.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    entries.append(json.loads(line))
+                except Exception:
+                    pass
+    # Find the last entry in this session whose raw matches
+    patched = False
+    for e in reversed(entries):
+        if e.get("session") == session and e.get("raw", "").strip() == raw.strip():
+            e["output"] = corrected_output
+            patched = True
+            break
+    if not patched:
+        return False
+    _DIR.mkdir(parents=True, exist_ok=True)
+    with _LOG_PATH.open("w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    return True
+
+
 def clear() -> None:
     if _LOG_PATH.exists():
         _LOG_PATH.unlink()

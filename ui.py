@@ -32,6 +32,7 @@ import uuid
 import stt  # sets up CUDA DLLs on import
 import corrections
 import history
+import synthesis
 
 # Automation layer (command mode): route a transcript to a registered n8n
 # workflow and fire its webhook. See automation/ and docs/adr/.
@@ -438,6 +439,19 @@ class App:
         self.history_seg.set(cur_hist)
         self.history_seg.grid(row=7, column=1, sticky="w", padx=(0, 14), pady=8)
         self._history_values = _HISTORY_VALUES
+
+        # AI rule synthesis
+        label(card, "AI Rules", 8)
+        ai_row = ctk.CTkFrame(card, fg_color="transparent")
+        ai_row.grid(row=8, column=1, sticky="ew", padx=(0, 14), pady=8)
+        self._synth_status = ctk.CTkLabel(
+            ai_row, text="idle" if not synthesis.rules_exist() else "rules loaded",
+            text_color="#888", font=ctk.CTkFont(size=12), anchor="w",
+        )
+        self._synth_status.pack(side="right", padx=(8, 0))
+        ctk.CTkButton(
+            ai_row, text="Synthesize", width=110, command=self._run_synthesis,
+        ).pack(side="left")
 
         # --- Advanced (collapsible) ----------------------------------------
         self.adv_btn = ctk.CTkButton(
@@ -1380,6 +1394,8 @@ class App:
                 new_map = corrections.record(display, corrected)
                 self._corrections = new_map
                 self._last_typed = corrected + " "
+                history.patch_last(self._session_id, display, corrected)
+                synthesis.invalidate_cache()
                 self.log_line(f"[correct] '{display}' → '{corrected}'")
 
             self.root.after(150, _retype)
@@ -1399,6 +1415,23 @@ class App:
         entry.bind("<Escape>", _cancel)
         win.protocol("WM_DELETE_WINDOW", _cancel)
         win.after(8000, _auto_cancel)
+
+    def _run_synthesis(self) -> None:
+        self._synth_status.configure(text="generating…", text_color="#e0a106")
+
+        def _work():
+            try:
+                _path, code = synthesis.synthesize()
+                n = code.count("re.sub") + code.count("replace")
+                self.root.after(0, lambda: self._synth_status.configure(
+                    text=f"✓ rules updated ({n} patterns)", text_color="#4caf50"
+                ))
+            except Exception as e:
+                self.root.after(0, lambda msg=str(e): self._synth_status.configure(
+                    text=f"✗ {msg[:60]}", text_color="#e05050"
+                ))
+
+        threading.Thread(target=_work, daemon=True).start()
 
     def _maybe_log(self, raw: str, output: str) -> None:
         mode = self.settings.get("history_mode", "full")
@@ -1486,6 +1519,7 @@ class App:
                     hotwords=corrections.hotwords(self._corrections),
                 )
             text = corrections.apply(raw, self._corrections)
+            text = synthesis.apply_generated(text)
             self._maybe_log(raw, text)
             if text:
                 expansion = stt.apply_snippet(text, self.snippets)
@@ -1549,6 +1583,7 @@ class App:
                         hotwords=corrections.hotwords(self._corrections),
                     )
                 text = corrections.apply(raw, self._corrections)
+                text = synthesis.apply_generated(text)
                 self._maybe_log(raw, text)
                 expansion = stt.apply_snippet(text, self.snippets)
                 if expansion is not None:
@@ -1585,6 +1620,7 @@ class App:
 
             def out(text):
                 corrected = corrections.apply(text, self._corrections)
+                corrected = synthesis.apply_generated(corrected)
                 self._maybe_log(text, corrected)
                 keyboard.write(corrected, delay=0)
                 self._last_typed += corrected
