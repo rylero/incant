@@ -1436,6 +1436,7 @@ class App:
             self.log_line("[stt] still transcribing…")
             return
         if not self.engine.capturing:
+            self._session_id = str(uuid.uuid4())[:8]
             self.engine.begin_capture()
             self.set_status("● recording… (hotkey again to stop)")
         else:
@@ -1475,6 +1476,7 @@ class App:
     # continuous ------------------------------------------------------------
     def _toggle_continuous(self) -> None:
         if not self.continuous_on:
+            self._session_id = str(uuid.uuid4())[:8]
             gap = float(self.settings.get("silence_s", 1.0))
             rms = float(self.settings.get("mic_rms", 0.012))
             self.segmenter = stt.PhraseSegmenter(
@@ -1536,6 +1538,7 @@ class App:
     # word by word ----------------------------------------------------------
     def _toggle_word(self) -> None:
         if self.word_streamer is None:
+            self._session_id = str(uuid.uuid4())[:8]
             self._last_typed = ""
 
             def tx(audio, prompt):
