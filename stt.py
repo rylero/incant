@@ -209,6 +209,15 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def apply_snippet(text: str, snippets: dict) -> str | None:
+    """Return expansion if text exactly matches a snippet phrase (case-insensitive), else None."""
+    normalized = text.lower().strip().rstrip(".,!?;:")
+    for phrase, expansion in snippets.items():
+        if normalized == phrase.lower().strip():
+            return expansion
+    return None
+
+
 def transcribe_audio(
     model: WhisperModel,
     audio: np.ndarray,

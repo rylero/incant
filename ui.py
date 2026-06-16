@@ -71,6 +71,7 @@ DEFAULTS = {
     "mic_rms": 0.004,  # continuous silence gate (mic sensitivity)
     "webhook_url": "",  # n8n webhook for command mode (empty = AI-clean + type)
     "review_hotkey": "ctrl+alt+r",  # pops overlay to correct the last transcript
+    "snippets": {},  # phrase → expansion text mappings
 }
 
 STATUS_COLORS = {
@@ -175,6 +176,7 @@ class App:
     def __init__(self, root: ctk.CTk) -> None:
         self.root = root
         self.settings = load_settings()
+        self.snippets: dict[str, str] = dict(self.settings.get("snippets", {}))
         self.model = None
         self.model_lock = threading.Lock()
         self.engine = stt.AudioEngine(
@@ -195,6 +197,7 @@ class App:
         # log
         self._log_lines: list[str] = []
         self._log_win: ctk.CTkToplevel | None = None
+        self._snip_win: ctk.CTkToplevel | None = None
         self._log_box: ctk.CTkTextbox | None = None
         self.adv_open = False
         # corrections
@@ -260,6 +263,15 @@ class App:
         ).pack(anchor="w")
         header_btns = ctk.CTkFrame(header, fg_color="transparent")
         header_btns.grid(row=0, column=2, sticky="e")
+        ctk.CTkButton(
+            header_btns,
+            text="Snippets",
+            width=84,
+            height=30,
+            fg_color=SURFACE_ALT,
+            hover_color=HOVER,
+            command=self.open_snippets_window,
+        ).pack(side="left", padx=(0, 6))
         ctk.CTkButton(
             header_btns,
             text="Activity",
@@ -541,6 +553,93 @@ class App:
         val_lbl.configure(text=fmt(var.get()))
         self.persist()
         self.engine.set_preroll(float(self.preroll_var.get()))
+
+    # --------------------------------------------------------- snippets window
+    def open_snippets_window(self) -> None:
+        if self._snip_win is not None and self._snip_win.winfo_exists():
+            self._snip_win.focus()
+            return
+        win = ctk.CTkToplevel(self.root, fg_color=BG)
+        win.title("incant — snippets")
+        win.geometry("620x400")
+        win.minsize(480, 260)
+        try:
+            win.after(250, lambda: win.iconbitmap(str(ICON_ICO)))
+        except Exception:  # noqa: BLE001
+            pass
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(
+            win,
+            text="Say the phrase exactly to paste the expansion instead.",
+            text_color="#7a7a7a",
+            font=ctk.CTkFont(size=12),
+        ).grid(row=0, column=0, sticky="w", padx=14, pady=(12, 4))
+        scroll = ctk.CTkScrollableFrame(win, fg_color=SURFACE)
+        scroll.grid(row=1, column=0, sticky="nsew", padx=10, pady=4)
+        scroll.grid_columnconfigure(0, weight=1)
+        self._snip_win = win
+        self._snip_scroll = scroll
+        self._snip_rows: list[tuple] = []
+        for phrase, expansion in self.snippets.items():
+            self._add_snippet_row(phrase, expansion)
+        ctk.CTkButton(
+            win,
+            text="+ Add snippet",
+            fg_color=SURFACE_ALT,
+            hover_color=HOVER,
+            command=lambda: self._add_snippet_row("", ""),
+        ).grid(row=2, column=0, pady=(4, 12))
+
+        def _on_close():
+            self._snip_win = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
+    def _add_snippet_row(self, phrase: str, expansion: str) -> None:
+        scroll = self._snip_scroll
+        row_idx = len(self._snip_rows)
+        row_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        row_frame.grid(row=row_idx, column=0, sticky="ew", padx=4, pady=3)
+        row_frame.grid_columnconfigure(2, weight=1)
+        phrase_var = ctk.StringVar(value=phrase)
+        expansion_var = ctk.StringVar(value=expansion)
+        ctk.CTkEntry(
+            row_frame,
+            textvariable=phrase_var,
+            placeholder_text="trigger phrase",
+            width=160,
+        ).grid(row=0, column=0, padx=(0, 6))
+        ctk.CTkLabel(row_frame, text="→", width=20).grid(row=0, column=1, padx=2)
+        ctk.CTkEntry(
+            row_frame,
+            textvariable=expansion_var,
+            placeholder_text="expansion text",
+        ).grid(row=0, column=2, sticky="ew", padx=(4, 6))
+
+        def delete_row():
+            self._snip_rows = [(p, e, f) for p, e, f in self._snip_rows if f is not row_frame]
+            row_frame.destroy()
+            self._save_snippets()
+
+        ctk.CTkButton(
+            row_frame, text="✕", width=32, fg_color="#a33", hover_color="#822",
+            command=delete_row,
+        ).grid(row=0, column=3)
+        phrase_var.trace_add("write", lambda *_: self._save_snippets())
+        expansion_var.trace_add("write", lambda *_: self._save_snippets())
+        self._snip_rows.append((phrase_var, expansion_var, row_frame))
+
+    def _save_snippets(self) -> None:
+        self.snippets = {}
+        for phrase_var, expansion_var, _ in self._snip_rows:
+            p = phrase_var.get().strip()
+            e = expansion_var.get()
+            if p:
+                self.snippets[p] = e
+        self.settings["snippets"] = self.snippets
+        save_settings(self.settings)
 
     # ------------------------------------------------------------ log window
     def open_log_window(self) -> None:
@@ -1043,6 +1142,13 @@ class App:
                 self.log_line(f"[{detected}] {text}")
                 self._last_typed = typed
                 keyboard.write(typed, delay=0)
+                expansion = stt.apply_snippet(text, self.snippets)
+                if expansion is not None:
+                    self.log_line(f"[{detected}] {text} → [snippet]")
+                    keyboard.write(expansion + " ", delay=0)
+                else:
+                    self.log_line(f"[{detected}] {text}")
+                    keyboard.write(text + " ", delay=0)
             else:
                 self.log_line("[stt] (nothing heard)")
             self.set_status("ready — press your hotkey to talk")
@@ -1098,6 +1204,16 @@ class App:
                 if out:
                     self.log_line(f"› {text}")
                     self._last_typed = out
+                expansion = stt.apply_snippet(text, self.snippets)
+                if expansion is not None:
+                    prefix = " " if self.stitcher and self.stitcher.prompt else ""
+                    if self.stitcher:
+                        self.stitcher.next(text)  # keep context current
+                    out = prefix + expansion
+                else:
+                    out = self.stitcher.next(text) if self.stitcher else text
+                if out:
+                    self.log_line(f"› {text}" + (" → [snippet]" if expansion is not None else ""))
                     keyboard.write(out, delay=0)
             except Exception as e:  # noqa: BLE001
                 self.log_line(f"[stt] phrase error: {e}")
