@@ -1138,17 +1138,15 @@ class App:
                 )
             text = corrections.apply(text, self._corrections)
             if text:
-                typed = text + " "
-                self.log_line(f"[{detected}] {text}")
-                self._last_typed = typed
-                keyboard.write(typed, delay=0)
                 expansion = stt.apply_snippet(text, self.snippets)
                 if expansion is not None:
+                    typed = expansion + " "
                     self.log_line(f"[{detected}] {text} → [snippet]")
-                    keyboard.write(expansion + " ", delay=0)
                 else:
+                    typed = text + " "
                     self.log_line(f"[{detected}] {text}")
-                    keyboard.write(text + " ", delay=0)
+                self._last_typed = typed
+                keyboard.write(typed, delay=0)
             else:
                 self.log_line("[stt] (nothing heard)")
             self.set_status("ready — press your hotkey to talk")
@@ -1200,20 +1198,17 @@ class App:
                         hotwords=corrections.hotwords(self._corrections),
                     )
                 text = corrections.apply(text, self._corrections)
-                out = self.stitcher.next(text) if self.stitcher else text
-                if out:
-                    self.log_line(f"› {text}")
-                    self._last_typed = out
                 expansion = stt.apply_snippet(text, self.snippets)
                 if expansion is not None:
                     prefix = " " if self.stitcher and self.stitcher.prompt else ""
                     if self.stitcher:
-                        self.stitcher.next(text)  # keep context current
+                        self.stitcher.next(text)  # update context with original words
                     out = prefix + expansion
                 else:
                     out = self.stitcher.next(text) if self.stitcher else text
                 if out:
                     self.log_line(f"› {text}" + (" → [snippet]" if expansion is not None else ""))
+                    self._last_typed = out
                     keyboard.write(out, delay=0)
             except Exception as e:  # noqa: BLE001
                 self.log_line(f"[stt] phrase error: {e}")
