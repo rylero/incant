@@ -47,3 +47,36 @@ def search(entries: list[dict], query: str) -> list[dict]:
 
 def session_entries(entries: list[dict], session: str) -> list[dict]:
     return [e for e in entries if e.get("session") == session]
+
+
+def sessions(entries: list[dict]) -> list[dict]:
+    """Group entries by session; return one summary dict per session, newest first."""
+    groups: dict[str, list[dict]] = {}
+    for e in entries:
+        sid = e.get("session", "")
+        groups.setdefault(sid, []).append(e)
+    result = []
+    for sid, es in groups.items():
+        es = sorted(es, key=lambda x: x.get("ts", 0))
+        result.append({
+            "session": sid,
+            "ts": es[0].get("ts", 0),
+            "ts_last": es[-1].get("ts", 0),
+            "count": len(es),
+            "preview": es[0].get("output", es[0].get("raw", "")),
+            "entries": es,
+        })
+    return sorted(result, key=lambda x: x["ts"], reverse=True)
+
+
+def search_sessions(summaries: list[dict], query: str) -> list[dict]:
+    if not query.strip():
+        return summaries
+    q = query.lower()
+    return [
+        s for s in summaries
+        if any(
+            q in e.get("output", "").lower() or q in e.get("raw", "").lower()
+            for e in s["entries"]
+        )
+    ]

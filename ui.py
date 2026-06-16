@@ -715,10 +715,11 @@ class App:
             return
 
         all_entries = history.load_all()
+        all_sessions = history.sessions(all_entries)
 
         win = ctk.CTkToplevel(self.root, fg_color=BG)
         win.title("incant — history")
-        win.geometry("660x520")
+        win.geometry("660x540")
         win.minsize(480, 320)
         try:
             win.after(250, lambda: win.iconbitmap(str(ICON_ICO)))
@@ -735,12 +736,12 @@ class App:
 
         active_screen = [None]
 
-        def _clear():
+        def _clear() -> None:
             if active_screen[0] is not None:
                 active_screen[0].destroy()
                 active_screen[0] = None
 
-        def _show_search(restore_query: str = "") -> None:
+        def _show_search(restore_query: str = "", restore_mode: str = "sessions") -> None:
             _clear()
             frame = ctk.CTkFrame(container, fg_color="transparent")
             frame.grid(row=0, column=0, sticky="nsew")
@@ -748,17 +749,25 @@ class App:
             frame.grid_rowconfigure(1, weight=1)
             active_screen[0] = frame
 
-            search_bar = ctk.CTkFrame(frame, fg_color="transparent")
-            search_bar.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
-            search_bar.grid_columnconfigure(0, weight=1)
+            top = ctk.CTkFrame(frame, fg_color="transparent")
+            top.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
+            top.grid_columnconfigure(1, weight=1)
+
+            mode_var = [restore_mode]
+            view_seg = ctk.CTkSegmentedButton(
+                top, values=["Sessions", "Phrases"], width=180,
+                command=lambda v: (mode_var.__setitem__(0, v.lower()), _render(q_var.get())),
+            )
+            view_seg.set(restore_mode.capitalize())
+            view_seg.grid(row=0, column=0, sticky="w", padx=(0, 10))
 
             q_var = ctk.StringVar(value=restore_query)
             q_entry = ctk.CTkEntry(
-                search_bar, textvariable=q_var,
+                top, textvariable=q_var,
                 placeholder_text="Search history…",
                 font=ctk.CTkFont(size=14),
             )
-            q_entry.grid(row=0, column=0, sticky="ew")
+            q_entry.grid(row=0, column=1, sticky="ew")
             q_entry.focus_set()
 
             results = ctk.CTkScrollableFrame(frame, fg_color="transparent")
@@ -768,18 +777,68 @@ class App:
             def _render(q: str = "") -> None:
                 for w in results.winfo_children():
                     w.destroy()
-                matches = history.search(all_entries, q)
-                if not matches:
-                    msg = "No history yet." if not all_entries else "No results."
-                    ctk.CTkLabel(
-                        results, text=msg, text_color="#555",
-                        font=ctk.CTkFont(size=13),
-                    ).pack(pady=24)
-                    return
-                for entry in reversed(matches):
-                    _result_row(results, entry, q)
+                if mode_var[0] == "sessions":
+                    matches = history.search_sessions(all_sessions, q)
+                    if not matches:
+                        msg = "No history yet." if not all_entries else "No results."
+                        ctk.CTkLabel(results, text=msg, text_color="#555",
+                                     font=ctk.CTkFont(size=13)).pack(pady=24)
+                        return
+                    for sess in matches:
+                        _session_row(results, sess)
+                else:
+                    matches = history.search(all_entries, q)
+                    if not matches:
+                        msg = "No history yet." if not all_entries else "No results."
+                        ctk.CTkLabel(results, text=msg, text_color="#555",
+                                     font=ctk.CTkFont(size=13)).pack(pady=24)
+                        return
+                    for entry in reversed(matches):
+                        _phrase_row(results, entry)
 
-            def _result_row(parent: ctk.CTkScrollableFrame, entry: dict, q: str) -> None:
+            def _session_row(parent: ctk.CTkScrollableFrame, sess: dict) -> None:
+                ts = sess["ts"]
+                ts_last = sess["ts_last"]
+                dt = datetime.datetime.fromtimestamp(ts)
+                dt_last = datetime.datetime.fromtimestamp(ts_last)
+                date_str = dt.strftime("%b %d")
+                if dt.date() == dt_last.date():
+                    time_range = f"{dt.strftime('%I:%M')}–{dt_last.strftime('%I:%M %p')}"
+                else:
+                    time_range = f"{dt.strftime('%b %d %I:%M %p')}–{dt_last.strftime('%b %d %I:%M %p')}"
+                count = sess["count"]
+                preview = sess["preview"][:100] + ("…" if len(sess["preview"]) > 100 else "")
+                session = sess["session"]
+
+                row = ctk.CTkFrame(parent, fg_color=SURFACE, corner_radius=8)
+                row.pack(fill="x", padx=12, pady=3)
+                row.grid_columnconfigure(0, weight=1)
+
+                meta = ctk.CTkLabel(
+                    row, text=f"{date_str}  ·  {time_range}  ·  {count} phrase{'s' if count != 1 else ''}  ·  {session}",
+                    text_color="#555", font=ctk.CTkFont(size=11), anchor="w",
+                )
+                meta.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 2))
+
+                body_lbl = ctk.CTkLabel(
+                    row, text=preview, text_color="#c8c8c8",
+                    font=ctk.CTkFont(size=13), anchor="w", wraplength=580, justify="left",
+                )
+                body_lbl.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
+
+                def _click(s: dict = sess) -> None:
+                    _show_context(
+                        clicked=None, ctx_entries=s["entries"],
+                        session=s["session"], ts_ref=s["ts"],
+                        restore_query=q_var.get(), restore_mode="sessions",
+                    )
+
+                for widget in (row, meta, body_lbl):
+                    widget.bind("<Button-1>", lambda _: _click())
+                    widget.bind("<Enter>", lambda _, r=row: r.configure(fg_color=SURFACE_ALT))
+                    widget.bind("<Leave>", lambda _, r=row: r.configure(fg_color=SURFACE))
+
+            def _phrase_row(parent: ctk.CTkScrollableFrame, entry: dict) -> None:
                 ts = entry.get("ts", 0)
                 dt = datetime.datetime.fromtimestamp(ts)
                 time_str = dt.strftime("%b %d  ·  %I:%M %p")
@@ -798,14 +857,19 @@ class App:
                 meta.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 2))
 
                 body_lbl = ctk.CTkLabel(
-                    row, text=preview,
-                    text_color="#c8c8c8", font=ctk.CTkFont(size=13),
-                    anchor="w", wraplength=580, justify="left",
+                    row, text=preview, text_color="#c8c8c8",
+                    font=ctk.CTkFont(size=13), anchor="w", wraplength=580, justify="left",
                 )
                 body_lbl.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
 
                 def _click(e: dict = entry) -> None:
-                    _show_context(e, restore_query=q_var.get())
+                    _show_context(
+                        clicked=e,
+                        ctx_entries=history.session_entries(all_entries, e.get("session", "")),
+                        session=e.get("session", ""),
+                        ts_ref=e.get("ts", 0),
+                        restore_query=q_var.get(), restore_mode="phrases",
+                    )
 
                 for widget in (row, meta, body_lbl):
                     widget.bind("<Button-1>", lambda _: _click())
@@ -815,16 +879,20 @@ class App:
             q_var.trace_add("write", lambda *_: _render(q_var.get()))
             _render(restore_query)
 
-        def _show_context(clicked: dict, restore_query: str = "") -> None:
+        def _show_context(
+            clicked: dict | None,
+            ctx_entries: list[dict],
+            session: str,
+            ts_ref: float,
+            restore_query: str = "",
+            restore_mode: str = "sessions",
+        ) -> None:
             _clear()
             frame = ctk.CTkFrame(container, fg_color="transparent")
             frame.grid(row=0, column=0, sticky="nsew")
             frame.grid_columnconfigure(0, weight=1)
             frame.grid_rowconfigure(1, weight=1)
             active_screen[0] = frame
-
-            session = clicked.get("session", "")
-            ctx = history.session_entries(all_entries, session)
 
             hdr = ctk.CTkFrame(frame, fg_color="transparent")
             hdr.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
@@ -833,13 +901,13 @@ class App:
             ctk.CTkButton(
                 hdr, text="← Back", width=80, height=28,
                 fg_color=SURFACE_ALT, hover_color=HOVER,
-                command=lambda: _show_search(restore_query),
+                command=lambda: _show_search(restore_query, restore_mode),
             ).grid(row=0, column=0, sticky="w")
 
-            ts0 = clicked.get("ts", 0)
-            date_str = datetime.datetime.fromtimestamp(ts0).strftime("%b %d %Y")
+            date_str = datetime.datetime.fromtimestamp(ts_ref).strftime("%b %d %Y")
+            n = len(ctx_entries)
             ctk.CTkLabel(
-                hdr, text=f"Session {session}  ·  {date_str}",
+                hdr, text=f"Session {session}  ·  {date_str}  ·  {n} phrase{'s' if n != 1 else ''}",
                 text_color="#7a7a7a", font=ctk.CTkFont(size=12),
             ).grid(row=0, column=1, sticky="w", padx=(12, 0))
 
@@ -847,15 +915,15 @@ class App:
             scroll.grid(row=1, column=0, sticky="nsew")
             scroll.grid_columnconfigure(0, weight=1)
 
-            clicked_ts = clicked.get("ts", 0)
+            clicked_ts = clicked.get("ts", 0) if clicked else None
             highlight_row = [None]
 
-            for entry in ctx:
+            for entry in ctx_entries:
                 ts = entry.get("ts", 0)
                 dt = datetime.datetime.fromtimestamp(ts)
                 time_str = dt.strftime("%I:%M:%S %p")
                 text = entry.get("output", entry.get("raw", ""))
-                active = abs(ts - clicked_ts) < 0.001
+                active = clicked_ts is not None and abs(ts - clicked_ts) < 0.001
 
                 bg = "#1a3324" if active else SURFACE
                 row = ctk.CTkFrame(scroll, fg_color=bg, corner_radius=6)
