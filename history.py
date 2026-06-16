@@ -69,6 +69,33 @@ def sessions(entries: list[dict]) -> list[dict]:
     return sorted(result, key=lambda x: x["ts"], reverse=True)
 
 
+def delete_entry(ts: float) -> bool:
+    """Remove the entry with the given timestamp. Returns True if found."""
+    if not _LOG_PATH.exists():
+        return False
+    entries = []
+    found = False
+    with _LOG_PATH.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+                if not found and abs(e.get("ts", -1) - ts) < 0.001:
+                    found = True
+                    continue
+                entries.append(e)
+            except Exception:
+                pass
+    if not found:
+        return False
+    with _LOG_PATH.open("w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    return True
+
+
 def patch_last(session: str, raw: str, corrected_output: str) -> bool:
     """Update the output field of the most recent entry matching session+raw.
 

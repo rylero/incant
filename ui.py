@@ -299,6 +299,15 @@ class App:
             fg_color=SURFACE_ALT,
             hover_color=HOVER,
             command=self.open_history_window,
+        ).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            header_btns,
+            text="Corrections",
+            width=94,
+            height=30,
+            fg_color=SURFACE_ALT,
+            hover_color=HOVER,
+            command=self.open_corrections_window,
         ).pack(side="left")
 
         # --- Scrollable body (so Advanced scrolls on small windows) ---------
@@ -917,6 +926,14 @@ class App:
                 )
                 body_lbl.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
 
+                del_btn = ctk.CTkButton(
+                    row, text="✕", width=26, height=22,
+                    fg_color="transparent", hover_color="#5a1a1a",
+                    text_color="#666", font=ctk.CTkFont(size=11),
+                    command=lambda r=row, t=ts: (history.delete_entry(t), r.destroy()),
+                )
+                del_btn.grid(row=0, column=1, padx=(0, 6), pady=(6, 0))
+
                 def _click(e: dict = entry) -> None:
                     _show_context(
                         clicked=e,
@@ -1018,6 +1035,119 @@ class App:
 
         win.protocol("WM_DELETE_WINDOW", _on_close)
         _show_search()
+
+    def open_corrections_window(self) -> None:
+        win = ctk.CTkToplevel(self.root, fg_color=BG)
+        win.title("incant — corrections")
+        win.geometry("620x560")
+        win.grab_set()
+
+        ctk.CTkLabel(
+            win, text="Corrections",
+            font=ctk.CTkFont(size=20, weight="bold"),
+        ).pack(anchor="w", padx=20, pady=(18, 4))
+
+        # ---- Simple rules (corrections.json) --------------------------------
+        ctk.CTkLabel(
+            win, text="Simple rules  (corrections.json)",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#999",
+        ).pack(anchor="w", padx=20, pady=(8, 2))
+
+        simple_frame = ctk.CTkScrollableFrame(win, fg_color=SURFACE, corner_radius=10, height=180)
+        simple_frame.pack(fill="x", padx=20, pady=(0, 6))
+        simple_frame.grid_columnconfigure(0, weight=1)
+
+        def _refresh_simple():
+            for w in simple_frame.winfo_children():
+                w.destroy()
+            corr = corrections.load_map()
+            if not corr:
+                ctk.CTkLabel(
+                    simple_frame, text="No simple rules yet.",
+                    text_color="#555", font=ctk.CTkFont(size=12),
+                ).pack(padx=12, pady=8)
+                return
+            for wrong, right in sorted(corr.items()):
+                row = ctk.CTkFrame(simple_frame, fg_color="transparent")
+                row.pack(fill="x", padx=8, pady=2)
+                row.grid_columnconfigure(1, weight=1)
+                ctk.CTkLabel(
+                    row, text=f"{wrong!r}", text_color="#e0a106",
+                    font=ctk.CTkFont(size=13, family="Courier New"), anchor="w",
+                ).grid(row=0, column=0, sticky="w", padx=(4, 6))
+                ctk.CTkLabel(
+                    row, text="→", text_color="#555", width=20,
+                ).grid(row=0, column=1, sticky="w")
+                ctk.CTkLabel(
+                    row, text=f"{right!r}", text_color="#c8c8c8",
+                    font=ctk.CTkFont(size=13, family="Courier New"), anchor="w",
+                ).grid(row=0, column=2, sticky="w", padx=(0, 8))
+                ctk.CTkButton(
+                    row, text="Remove", width=72, height=24,
+                    fg_color="#5a1a1a", hover_color="#822",
+                    font=ctk.CTkFont(size=11),
+                    command=lambda k=wrong: (
+                        corrections.remove(k),
+                        self.__dict__.update({"_corrections": corrections.load_map()}),
+                        _refresh_simple(),
+                    ),
+                ).grid(row=0, column=3, padx=(8, 0))
+
+        _refresh_simple()
+
+        # ---- AI rules (correction_rules.py) ---------------------------------
+        ctk.CTkLabel(
+            win, text="AI-generated rules  (correction_rules.py)",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#999",
+        ).pack(anchor="w", padx=20, pady=(10, 2))
+
+        ai_outer = ctk.CTkFrame(win, fg_color=SURFACE, corner_radius=10)
+        ai_outer.pack(fill="both", expand=True, padx=20, pady=(0, 6))
+
+        ai_status_lbl = ctk.CTkLabel(
+            ai_outer, text="", text_color="#888", font=ctk.CTkFont(size=12), anchor="w",
+        )
+        ai_status_lbl.pack(anchor="w", padx=12, pady=(8, 2))
+
+        ai_code_box = ctk.CTkTextbox(
+            ai_outer, font=ctk.CTkFont(size=11, family="Courier New"),
+            fg_color="#0d0d0d", text_color="#a0d0a0", state="disabled", height=160,
+        )
+        ai_code_box.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+
+        def _refresh_ai():
+            code = synthesis.get_rules_code()
+            ai_code_box.configure(state="normal")
+            ai_code_box.delete("1.0", "end")
+            if code:
+                ai_status_lbl.configure(text=f"✓ rules loaded  ({len(code.splitlines())} lines)")
+                ai_code_box.insert("1.0", code)
+            else:
+                ai_status_lbl.configure(text="No AI rules yet — use the Synthesize button in Settings.")
+            ai_code_box.configure(state="disabled")
+
+        _refresh_ai()
+
+        def _delete_ai():
+            synthesis.delete_rules()
+            if hasattr(self, "_synth_status"):
+                self._synth_status.configure(text="idle", text_color="#888")
+            _refresh_ai()
+
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(0, 14))
+        ctk.CTkButton(
+            btn_row, text="Delete AI Rules", width=130,
+            fg_color="#5a1a1a", hover_color="#822",
+            command=_delete_ai,
+        ).pack(side="left")
+        ctk.CTkButton(
+            btn_row, text="Close", width=80,
+            fg_color=SURFACE_ALT, hover_color=HOVER,
+            command=win.destroy,
+        ).pack(side="right")
 
     # -------------------------------------------------------------- helpers
     def log_line(self, msg: str) -> None:

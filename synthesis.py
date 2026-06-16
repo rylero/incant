@@ -193,3 +193,15 @@ def apply_generated(text: str) -> str:
 
 def rules_exist() -> bool:
     return _RULES_PATH.exists()
+
+
+def get_rules_code() -> str | None:
+    if _RULES_PATH.exists():
+        return _RULES_PATH.read_text(encoding="utf-8")
+    return None
+
+
+def delete_rules() -> None:
+    if _RULES_PATH.exists():
+        _RULES_PATH.unlink()
+    invalidate_cache()

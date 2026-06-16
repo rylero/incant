@@ -67,6 +67,14 @@ def apply(text: str, corr: dict[str, str]) -> str:
     return text
 
 
+def remove(key: str) -> dict[str, str]:
+    """Remove a key from the substitution map. Returns updated map."""
+    m = load_map()
+    m.pop(key.lower(), None)
+    _save_map(m)
+    return m
+
+
 def hotwords(corr: dict[str, str]) -> str | None:
     """Single-word corrected values as a hotwords hint string for Whisper."""
     vals = [v for v in corr.values() if " " not in v]
