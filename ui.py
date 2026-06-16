@@ -1238,8 +1238,8 @@ class App:
                         beam_size=self._beam(),
                         hotwords=corrections.hotwords(self._corrections),
                     )
-<<<<<<< HEAD
-                text = corrections.apply(text, self._corrections)
+                text = corrections.apply(raw, self._corrections)
+                self._maybe_log(raw, text)
                 expansion = stt.apply_snippet(text, self.snippets)
                 if expansion is not None:
                     prefix = " " if self.stitcher and self.stitcher.prompt else ""
@@ -1248,11 +1248,6 @@ class App:
                     out = prefix + expansion
                 else:
                     out = self.stitcher.next(text) if self.stitcher else text
-=======
-                text = corrections.apply(raw, self._corrections)
-                self._maybe_log(raw, text)
-                out = self.stitcher.next(text) if self.stitcher else text
->>>>>>> 4115830 (Add history recording with Full / Corrections / Off modes)
                 if out:
                     self.log_line(f"› {text}" + (" → [snippet]" if expansion is not None else ""))
                     self._last_typed = out
