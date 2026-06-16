@@ -818,15 +818,22 @@ class App:
                 else:
                     time_range = f"{dt.strftime('%b %d %I:%M %p')}–{dt_last.strftime('%b %d %I:%M %p')}"
                 count = sess["count"]
-                preview = sess["preview"][:100] + ("…" if len(sess["preview"]) > 100 else "")
                 session = sess["session"]
+                full_text = " ".join(
+                    e.get("output", e.get("raw", "")) for e in sess["entries"]
+                )
+                preview = full_text[:100] + ("…" if len(full_text) > 100 else "")
+                meta_str = f"{date_str}  ·  {time_range}  ·  {count} phrase{'s' if count != 1 else ''}  ·  {session}"
+
+                expanded = [False]
+                expand_lbl = [None]
 
                 row = ctk.CTkFrame(parent, fg_color=SURFACE, corner_radius=8)
                 row.pack(fill="x", padx=12, pady=3)
                 row.grid_columnconfigure(0, weight=1)
 
                 meta = ctk.CTkLabel(
-                    row, text=f"{date_str}  ·  {time_range}  ·  {count} phrase{'s' if count != 1 else ''}  ·  {session}",
+                    row, text=f"▶  {meta_str}",
                     text_color="#555", font=ctk.CTkFont(size=11), anchor="w",
                 )
                 meta.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 2))
@@ -837,17 +844,40 @@ class App:
                 )
                 body_lbl.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
 
-                def _click(s: dict = sess) -> None:
-                    _show_context(
-                        clicked=None, ctx_entries=s["entries"],
-                        session=s["session"], ts_ref=s["ts"],
-                        restore_query=q_var.get(), restore_mode="sessions",
-                    )
+                def _hover_on(_: object, r: ctk.CTkFrame = row) -> None:
+                    r.configure(fg_color=SURFACE_ALT)
+
+                def _hover_off(_: object, r: ctk.CTkFrame = row) -> None:
+                    r.configure(fg_color=SURFACE)
+
+                def _toggle(_event: object = None) -> None:
+                    expanded[0] = not expanded[0]
+                    if expanded[0]:
+                        meta.configure(text=f"▼  {meta_str}")
+                        body_lbl.grid_remove()
+                        if expand_lbl[0] is None:
+                            lbl = ctk.CTkLabel(
+                                row, text=full_text, text_color="#d8d8d8",
+                                font=ctk.CTkFont(size=13), anchor="w",
+                                wraplength=580, justify="left",
+                            )
+                            lbl.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+                            lbl.bind("<Button-1>", _toggle)
+                            lbl.bind("<Enter>", _hover_on)
+                            lbl.bind("<Leave>", _hover_off)
+                            expand_lbl[0] = lbl
+                        else:
+                            expand_lbl[0].grid()
+                    else:
+                        meta.configure(text=f"▶  {meta_str}")
+                        if expand_lbl[0] is not None:
+                            expand_lbl[0].grid_remove()
+                        body_lbl.grid()
 
                 for widget in (row, meta, body_lbl):
-                    widget.bind("<Button-1>", lambda _: _click())
-                    widget.bind("<Enter>", lambda _, r=row: r.configure(fg_color=SURFACE_ALT))
-                    widget.bind("<Leave>", lambda _, r=row: r.configure(fg_color=SURFACE))
+                    widget.bind("<Button-1>", _toggle)
+                    widget.bind("<Enter>", _hover_on)
+                    widget.bind("<Leave>", _hover_off)
 
             def _phrase_row(parent: ctk.CTkScrollableFrame, entry: dict) -> None:
                 ts = entry.get("ts", 0)
