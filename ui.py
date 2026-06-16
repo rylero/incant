@@ -11,6 +11,7 @@ Run:  uv run ui
 from __future__ import annotations
 
 import ctypes
+import datetime
 import json
 import math
 import os
@@ -212,6 +213,7 @@ class App:
         self._review_win: ctk.CTkToplevel | None = None
         # history
         self._session_id: str = str(uuid.uuid4())[:8]
+        self._hist_win: ctk.CTkToplevel | None = None
 
         root.title("incant")
         root.geometry("540x620")
@@ -287,6 +289,15 @@ class App:
             fg_color=SURFACE_ALT,
             hover_color=HOVER,
             command=self.open_log_window,
+        ).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            header_btns,
+            text="History",
+            width=84,
+            height=30,
+            fg_color=SURFACE_ALT,
+            hover_color=HOVER,
+            command=self.open_history_window,
         ).pack(side="left")
 
         # --- Scrollable body (so Advanced scrolls on small windows) ---------
@@ -696,6 +707,194 @@ class App:
             win.destroy()
 
         win.protocol("WM_DELETE_WINDOW", _closed)
+
+    # ---------------------------------------------------------- history window
+    def open_history_window(self) -> None:
+        if self._hist_win is not None and self._hist_win.winfo_exists():
+            self._hist_win.focus()
+            return
+
+        all_entries = history.load_all()
+
+        win = ctk.CTkToplevel(self.root, fg_color=BG)
+        win.title("incant — history")
+        win.geometry("660x520")
+        win.minsize(480, 320)
+        try:
+            win.after(250, lambda: win.iconbitmap(str(ICON_ICO)))
+        except Exception:  # noqa: BLE001
+            pass
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(0, weight=1)
+        self._hist_win = win
+
+        container = ctk.CTkFrame(win, fg_color="transparent")
+        container.grid(row=0, column=0, sticky="nsew")
+        container.grid_columnconfigure(0, weight=1)
+        container.grid_rowconfigure(0, weight=1)
+
+        active_screen = [None]
+
+        def _clear():
+            if active_screen[0] is not None:
+                active_screen[0].destroy()
+                active_screen[0] = None
+
+        def _show_search(restore_query: str = "") -> None:
+            _clear()
+            frame = ctk.CTkFrame(container, fg_color="transparent")
+            frame.grid(row=0, column=0, sticky="nsew")
+            frame.grid_columnconfigure(0, weight=1)
+            frame.grid_rowconfigure(1, weight=1)
+            active_screen[0] = frame
+
+            search_bar = ctk.CTkFrame(frame, fg_color="transparent")
+            search_bar.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
+            search_bar.grid_columnconfigure(0, weight=1)
+
+            q_var = ctk.StringVar(value=restore_query)
+            q_entry = ctk.CTkEntry(
+                search_bar, textvariable=q_var,
+                placeholder_text="Search history…",
+                font=ctk.CTkFont(size=14),
+            )
+            q_entry.grid(row=0, column=0, sticky="ew")
+            q_entry.focus_set()
+
+            results = ctk.CTkScrollableFrame(frame, fg_color="transparent")
+            results.grid(row=1, column=0, sticky="nsew", padx=0, pady=0)
+            results.grid_columnconfigure(0, weight=1)
+
+            def _render(q: str = "") -> None:
+                for w in results.winfo_children():
+                    w.destroy()
+                matches = history.search(all_entries, q)
+                if not matches:
+                    msg = "No history yet." if not all_entries else "No results."
+                    ctk.CTkLabel(
+                        results, text=msg, text_color="#555",
+                        font=ctk.CTkFont(size=13),
+                    ).pack(pady=24)
+                    return
+                for entry in reversed(matches):
+                    _result_row(results, entry, q)
+
+            def _result_row(parent: ctk.CTkScrollableFrame, entry: dict, q: str) -> None:
+                ts = entry.get("ts", 0)
+                dt = datetime.datetime.fromtimestamp(ts)
+                time_str = dt.strftime("%b %d  ·  %I:%M %p")
+                session = entry.get("session", "?")
+                text = entry.get("output", entry.get("raw", ""))
+                preview = text[:100] + ("…" if len(text) > 100 else "")
+
+                row = ctk.CTkFrame(parent, fg_color=SURFACE, corner_radius=8)
+                row.pack(fill="x", padx=12, pady=3)
+                row.grid_columnconfigure(0, weight=1)
+
+                meta = ctk.CTkLabel(
+                    row, text=f"{time_str}  ·  {session}",
+                    text_color="#555", font=ctk.CTkFont(size=11), anchor="w",
+                )
+                meta.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 2))
+
+                body_lbl = ctk.CTkLabel(
+                    row, text=preview,
+                    text_color="#c8c8c8", font=ctk.CTkFont(size=13),
+                    anchor="w", wraplength=580, justify="left",
+                )
+                body_lbl.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
+
+                def _click(e: dict = entry) -> None:
+                    _show_context(e, restore_query=q_var.get())
+
+                for widget in (row, meta, body_lbl):
+                    widget.bind("<Button-1>", lambda _: _click())
+                    widget.bind("<Enter>", lambda _, r=row: r.configure(fg_color=SURFACE_ALT))
+                    widget.bind("<Leave>", lambda _, r=row: r.configure(fg_color=SURFACE))
+
+            q_var.trace_add("write", lambda *_: _render(q_var.get()))
+            _render(restore_query)
+
+        def _show_context(clicked: dict, restore_query: str = "") -> None:
+            _clear()
+            frame = ctk.CTkFrame(container, fg_color="transparent")
+            frame.grid(row=0, column=0, sticky="nsew")
+            frame.grid_columnconfigure(0, weight=1)
+            frame.grid_rowconfigure(1, weight=1)
+            active_screen[0] = frame
+
+            session = clicked.get("session", "")
+            ctx = history.session_entries(all_entries, session)
+
+            hdr = ctk.CTkFrame(frame, fg_color="transparent")
+            hdr.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
+            hdr.grid_columnconfigure(1, weight=1)
+
+            ctk.CTkButton(
+                hdr, text="← Back", width=80, height=28,
+                fg_color=SURFACE_ALT, hover_color=HOVER,
+                command=lambda: _show_search(restore_query),
+            ).grid(row=0, column=0, sticky="w")
+
+            ts0 = clicked.get("ts", 0)
+            date_str = datetime.datetime.fromtimestamp(ts0).strftime("%b %d %Y")
+            ctk.CTkLabel(
+                hdr, text=f"Session {session}  ·  {date_str}",
+                text_color="#7a7a7a", font=ctk.CTkFont(size=12),
+            ).grid(row=0, column=1, sticky="w", padx=(12, 0))
+
+            scroll = ctk.CTkScrollableFrame(frame, fg_color="transparent")
+            scroll.grid(row=1, column=0, sticky="nsew")
+            scroll.grid_columnconfigure(0, weight=1)
+
+            clicked_ts = clicked.get("ts", 0)
+            highlight_row = [None]
+
+            for entry in ctx:
+                ts = entry.get("ts", 0)
+                dt = datetime.datetime.fromtimestamp(ts)
+                time_str = dt.strftime("%I:%M:%S %p")
+                text = entry.get("output", entry.get("raw", ""))
+                active = abs(ts - clicked_ts) < 0.001
+
+                bg = "#1a3324" if active else SURFACE
+                row = ctk.CTkFrame(scroll, fg_color=bg, corner_radius=6)
+                row.pack(fill="x", padx=12, pady=2)
+
+                ctk.CTkLabel(
+                    row,
+                    text=("▶  " if active else "    ") + time_str + "   " + text,
+                    text_color="#e8e8e8" if active else "#a0a0a0",
+                    font=ctk.CTkFont(size=13, weight="bold" if active else "normal"),
+                    anchor="w", wraplength=590, justify="left",
+                ).pack(fill="x", padx=10, pady=6)
+
+                if active:
+                    highlight_row[0] = row
+
+            def _scroll_to_highlight() -> None:
+                r = highlight_row[0]
+                if r is None:
+                    return
+                try:
+                    r.update_idletasks()
+                    y = r.winfo_y()
+                    total = scroll._parent_frame.winfo_reqheight()
+                    view_h = scroll._parent_canvas.winfo_height()
+                    if total > 0:
+                        frac = max(0.0, min(1.0, (y - view_h // 2) / total))
+                        scroll._parent_canvas.yview_moveto(frac)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            win.after(120, _scroll_to_highlight)
+
+        def _on_close() -> None:
+            self._hist_win = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+        _show_search()
 
     # -------------------------------------------------------------- helpers
     def log_line(self, msg: str) -> None:
