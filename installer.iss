@@ -10,7 +10,7 @@
 ; Output goes to dist_installer\incant-setup.exe
 
 #define MyAppName "incant"
-#define MyAppVersion "0.2.0"
+#define MyAppVersion "1.3.0"
 #define MyAppExeName "incant.exe"
 
 [Setup]
