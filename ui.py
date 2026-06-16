@@ -767,8 +767,19 @@ class App:
                 placeholder_text="Search history…",
                 font=ctk.CTkFont(size=14),
             )
-            q_entry.grid(row=0, column=1, sticky="ew")
-            q_entry.focus_set()
+            q_entry.grid(row=0, column=1, sticky="ew", padx=(0, 10))
+
+            def _clear_history() -> None:
+                history.clear()
+                all_entries.clear()
+                all_sessions.clear()
+                _render(q_var.get())
+
+            ctk.CTkButton(
+                top, text="Clear", width=64, height=32,
+                fg_color="#3a1a1a", hover_color="#5a2020",
+                command=_clear_history,
+            ).grid(row=0, column=2, sticky="e")
 
             results = ctk.CTkScrollableFrame(frame, fg_color="transparent")
             results.grid(row=1, column=0, sticky="nsew", padx=0, pady=0)

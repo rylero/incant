@@ -69,6 +69,11 @@ def sessions(entries: list[dict]) -> list[dict]:
     return sorted(result, key=lambda x: x["ts"], reverse=True)
 
 
+def clear() -> None:
+    if _LOG_PATH.exists():
+        _LOG_PATH.unlink()
+
+
 def search_sessions(summaries: list[dict], query: str) -> list[dict]:
     if not query.strip():
         return summaries
