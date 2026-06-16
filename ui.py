@@ -25,8 +25,12 @@ import keyboard
 import customtkinter as ctk
 from PIL import Image
 
+import re
+import uuid
+
 import stt  # sets up CUDA DLLs on import
 import corrections
+import history
 
 # Automation layer (command mode): route a transcript to a registered n8n
 # workflow and fire its webhook. See automation/ and docs/adr/.
@@ -71,6 +75,7 @@ DEFAULTS = {
     "mic_rms": 0.004,  # continuous silence gate (mic sensitivity)
     "webhook_url": "",  # n8n webhook for command mode (empty = AI-clean + type)
     "review_hotkey": "ctrl+alt+r",  # pops overlay to correct the last transcript
+    "history_mode": "full",         # "full" | "corrections" | "off"
     "snippets": {},  # phrase → expansion text mappings
 }
 
@@ -205,6 +210,8 @@ class App:
         self._last_typed: str = ""
         self._review_hotkey_handle = None
         self._review_win: ctk.CTkToplevel | None = None
+        # history
+        self._session_id: str = str(uuid.uuid4())[:8]
 
         root.title("incant")
         root.geometry("540x620")
@@ -403,6 +410,23 @@ class App:
             rev_row, text="Set", width=64, command=self.capture_review_hotkey
         )
         self.rev_set_btn.grid(row=0, column=1)
+
+        # History recording mode
+        label(card, "History", 7)
+        _HISTORY_LABELS = ["Full", "Corrections", "Off"]
+        _HISTORY_VALUES = {"Full": "full", "Corrections": "corrections", "Off": "off"}
+        _HISTORY_KEYS = {v: k for k, v in _HISTORY_VALUES.items()}
+        cur_hist = _HISTORY_KEYS.get(
+            self.settings.get("history_mode", DEFAULTS["history_mode"]), "Full"
+        )
+        self.history_seg = ctk.CTkSegmentedButton(
+            card,
+            values=_HISTORY_LABELS,
+            command=lambda _v: self.persist(),
+        )
+        self.history_seg.set(cur_hist)
+        self.history_seg.grid(row=7, column=1, sticky="w", padx=(0, 14), pady=8)
+        self._history_values = _HISTORY_VALUES
 
         # --- Advanced (collapsible) ----------------------------------------
         self.adv_btn = ctk.CTkButton(
@@ -878,6 +902,7 @@ class App:
             hotkey=self.hotkey_var.get().strip(),
             command_hotkey=self.command_hotkey_var.get().strip(),
             review_hotkey=self.review_hotkey_var.get().strip(),
+            history_mode=self._history_values.get(self.history_seg.get(), "full"),
             model=MODELS[self.model_menu.get()],
             language="" if lang == "auto" else lang,
             output_mode=OUTPUT_MODES[self.output_seg.get()],
@@ -1067,6 +1092,21 @@ class App:
         win.protocol("WM_DELETE_WINDOW", _cancel)
         win.after(8000, _auto_cancel)
 
+    def _maybe_log(self, raw: str, output: str) -> None:
+        mode = self.settings.get("history_mode", "full")
+        if mode == "off" or not raw:
+            return
+        if mode == "corrections" and self._corrections:
+            # Only log phrases that contain a previously-corrected word
+            if not any(
+                re.search(r"\b" + re.escape(k) + r"\b", raw, re.IGNORECASE)
+                for k in self._corrections
+            ):
+                return
+        elif mode == "corrections":
+            return  # no corrections yet; nothing to track
+        history.log_phrase(self._session_id, raw, output)
+
     # ----------------------------------------------------------------- model
     def reload_model(self) -> None:
         size = MODELS[self.model_menu.get()]
@@ -1132,11 +1172,12 @@ class App:
         try:
             lang = self.settings.get("language") or None
             with self.model_lock:
-                text, detected = stt.transcribe_audio(
+                raw, detected = stt.transcribe_audio(
                     self.model, audio, lang, beam_size=self._beam(),
                     hotwords=corrections.hotwords(self._corrections),
                 )
-            text = corrections.apply(text, self._corrections)
+            text = corrections.apply(raw, self._corrections)
+            self._maybe_log(raw, text)
             if text:
                 expansion = stt.apply_snippet(text, self.snippets)
                 if expansion is not None:
@@ -1189,7 +1230,7 @@ class App:
                 lang = self.settings.get("language") or None
                 prompt = self.stitcher.prompt if self.stitcher else None
                 with self.model_lock:
-                    text, _ = stt.transcribe_audio(
+                    raw, _ = stt.transcribe_audio(
                         self.model,
                         audio,
                         lang,
@@ -1197,6 +1238,7 @@ class App:
                         beam_size=self._beam(),
                         hotwords=corrections.hotwords(self._corrections),
                     )
+<<<<<<< HEAD
                 text = corrections.apply(text, self._corrections)
                 expansion = stt.apply_snippet(text, self.snippets)
                 if expansion is not None:
@@ -1206,6 +1248,11 @@ class App:
                     out = prefix + expansion
                 else:
                     out = self.stitcher.next(text) if self.stitcher else text
+=======
+                text = corrections.apply(raw, self._corrections)
+                self._maybe_log(raw, text)
+                out = self.stitcher.next(text) if self.stitcher else text
+>>>>>>> 4115830 (Add history recording with Full / Corrections / Off modes)
                 if out:
                     self.log_line(f"› {text}" + (" → [snippet]" if expansion is not None else ""))
                     self._last_typed = out
@@ -1232,6 +1279,7 @@ class App:
 
             def out(text):
                 corrected = corrections.apply(text, self._corrections)
+                self._maybe_log(text, corrected)
                 keyboard.write(corrected, delay=0)
                 self._last_typed += corrected
                 self.log_line(f"› {corrected.strip()}")
